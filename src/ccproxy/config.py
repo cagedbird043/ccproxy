@@ -62,6 +62,7 @@ def default_config() -> dict[str, Any]:
             "port": 15721,
             "auto_failover": True,
             "cooldown_sec": 60,
+            "max_body_mb": 64,
         },
         "apps": {
             app: {
@@ -106,6 +107,7 @@ def update_proxy_config(
     port: int | None = None,
     auto_failover: bool | None = None,
     cooldown_sec: int | None = None,
+    max_body_mb: int | None = None,
 ) -> dict[str, Any]:
     proxy = proxy_config(data)
     changed: dict[str, Any] = {}
@@ -132,7 +134,21 @@ def update_proxy_config(
             proxy["cooldown_sec"] = cooldown_sec
             changed["cooldown_sec"] = cooldown_sec
 
+    if max_body_mb is not None:
+        if max_body_mb <= 0:
+            raise ValueError(f"invalid max_body_mb: {max_body_mb}")
+        if max_body_mb != int(proxy.get("max_body_mb", 64)):
+            proxy["max_body_mb"] = max_body_mb
+            changed["max_body_mb"] = max_body_mb
+
     return changed
+
+
+def proxy_max_body_bytes(data: dict[str, Any]) -> int:
+    max_body_mb = int(data["proxy"].get("max_body_mb", 64))
+    if max_body_mb <= 0:
+        raise ValueError(f"invalid max_body_mb: {max_body_mb}")
+    return max_body_mb * 1024 * 1024
 
 
 def init_config() -> Path:
@@ -271,6 +287,7 @@ def proxy_runtime_status(data: dict[str, Any]) -> dict[str, Any]:
         "port": port,
         "auto_failover": bool(data["proxy"].get("auto_failover", True)),
         "cooldown_sec": int(data["proxy"].get("cooldown_sec", 60)),
+        "max_body_mb": int(data["proxy"].get("max_body_mb", 64)),
         "log_path": str(log_path()),
         "health_path": str(health_state_path()),
         "healthy": health_ok,

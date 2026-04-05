@@ -9,7 +9,7 @@ from typing import Any
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from ccproxy.adapters import ADAPTERS_BY_APP, build_upstream_url, route_request
-from ccproxy.config import current_provider_id, load_config, save_config
+from ccproxy.config import current_provider_id, load_config, proxy_max_body_bytes, save_config
 from ccproxy.health_store import (
     load_health_state,
     record_failure,
@@ -226,8 +226,8 @@ async def forward(request: web.Request) -> web.StreamResponse:
     )
 
 
-def make_app() -> web.Application:
-    app = web.Application()
+def make_app(max_body_bytes: int) -> web.Application:
+    app = web.Application(client_max_size=max_body_bytes)
     app.router.add_get("/__ccproxy/health", health)
     app.router.add_route("*", "/{tail:.*}", forward)
     return app
@@ -235,7 +235,9 @@ def make_app() -> web.Application:
 
 async def run_proxy(host: str, port: int) -> None:
     timeout = ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=180)
-    app = make_app()
+    config = load_config()
+    max_body_bytes = proxy_max_body_bytes(config)
+    app = make_app(max_body_bytes)
     app["session"] = ClientSession(timeout=timeout, auto_decompress=False)
     app["health_state"] = load_health_state()
     app["health_lock"] = asyncio.Lock()
@@ -251,7 +253,12 @@ async def run_proxy(host: str, port: int) -> None:
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
-    logging.info("ccproxy listening on http://%s:%s", host, port)
+    logging.info(
+        "ccproxy listening on http://%s:%s (max_body_mb=%s)",
+        host,
+        port,
+        config["proxy"].get("max_body_mb", 64),
+    )
 
     loop = asyncio.get_running_loop()
 

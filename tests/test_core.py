@@ -4,14 +4,20 @@ from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
 from ccproxy.completion import completion_provider_ids, render_completion
 from ccproxy.cli import build_health_snapshot, detect_cli_lang
-from ccproxy.config import default_config, proxy_runtime_status, resolve_provider_selector, update_proxy_config
+from ccproxy.config import (
+    default_config,
+    proxy_max_body_bytes,
+    proxy_runtime_status,
+    resolve_provider_selector,
+    update_proxy_config,
+)
 from ccproxy.health_store import (
     default_health_state,
     record_failure,
     record_success,
     reorder_providers_by_cooldown,
 )
-from ccproxy.proxy import provider_attempt_order, should_failover_status
+from ccproxy.proxy import make_app, provider_attempt_order, should_failover_status
 from ccproxy.service import build_unit
 
 
@@ -136,10 +142,22 @@ def test_record_success_clears_cooldown() -> None:
 
 def test_update_proxy_config_changes_cooldown_and_failover() -> None:
     data = default_config()
-    changed = update_proxy_config(data, cooldown_sec=120, auto_failover=False)
-    assert changed == {"auto_failover": False, "cooldown_sec": 120}
+    changed = update_proxy_config(data, cooldown_sec=120, auto_failover=False, max_body_mb=96)
+    assert changed == {"auto_failover": False, "cooldown_sec": 120, "max_body_mb": 96}
     assert data["proxy"]["cooldown_sec"] == 120
     assert data["proxy"]["auto_failover"] is False
+    assert data["proxy"]["max_body_mb"] == 96
+
+
+def test_proxy_max_body_bytes_uses_mebibytes() -> None:
+    data = default_config()
+    data["proxy"]["max_body_mb"] = 64
+    assert proxy_max_body_bytes(data) == 64 * 1024 * 1024
+
+
+def test_make_app_uses_configured_client_max_size() -> None:
+    app = make_app(8 * 1024 * 1024)
+    assert app._client_max_size == 8 * 1024 * 1024
 
 
 def test_detect_cli_lang_prefers_locale_environment() -> None:

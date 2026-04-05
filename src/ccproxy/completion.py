@@ -120,7 +120,7 @@ def render_bash_completion() -> str:
                   config)
                     case "$subsubcmd" in
                       set)
-                        opts="--host --port --auto-failover --cooldown-sec"
+                        opts="--host --port --auto-failover --cooldown-sec --max-body-mb"
                         ;;
                     esac
                     ;;
@@ -321,7 +321,8 @@ def render_zsh_completion() -> str:
                         '--host[listen host]:host:' \
                         '--port[listen port]:port:' \
                         '--auto-failover[enable or disable auto failover]:(on off)' \
-                        '--cooldown-sec[cooldown seconds]:seconds:'
+                        '--cooldown-sec[cooldown seconds]:seconds:' \
+                        '--max-body-mb[maximum accepted request body size in MiB]:mebibytes:'
                       ;;
                   esac
                   ;;
@@ -370,6 +371,7 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l port
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l auto-failover -a 'on off'
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l cooldown-sec
+        complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l max-body-mb
 
         complete -c ccproxy -n '__fish_seen_subcommand_from import-cc-switch' -l db-path
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l name

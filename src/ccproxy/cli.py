@@ -21,6 +21,7 @@ from ccproxy.config import (
     log_path,
     normalize_app,
     proxy_config,
+    proxy_max_body_bytes,
     proxy_runtime_status,
     save_config,
     set_current_provider,
@@ -210,6 +211,11 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         "--cooldown-sec",
         type=int,
         help=t("Cooldown applied to a failed provider before it is tried again.", "失败 provider 在再次尝试前的冷却秒数。"),
+    )
+    proxy_config_set.add_argument(
+        "--max-body-mb",
+        type=int,
+        help=t("Maximum accepted request body size in MiB.", "允许的最大请求体大小，单位 MiB。"),
     )
 
     proxy_sub.add_parser("down", help=t("Stop background proxy.", "停止后台代理。"))
@@ -413,6 +419,7 @@ def cmd_proxy_status() -> int:
         )
     )
     print(t(f"cooldown sec: {status['cooldown_sec']}", f"冷却秒数: {status['cooldown_sec']}"))
+    print(t(f"max body mb: {status['max_body_mb']}", f"请求体上限 MiB: {status['max_body_mb']}"))
     if status["pid"]:
         print(f"pid: {status['pid']}")
     if status["manager"]:
@@ -533,6 +540,7 @@ def cmd_proxy_config_set(
     port: int | None,
     auto_failover: str | None,
     cooldown_sec: int | None,
+    max_body_mb: int | None,
 ) -> int:
     data = load_config()
     changed = update_proxy_config(
@@ -541,6 +549,7 @@ def cmd_proxy_config_set(
         port=port,
         auto_failover=(auto_failover == "on") if auto_failover is not None else None,
         cooldown_sec=cooldown_sec,
+        max_body_mb=max_body_mb,
     )
     save_config(data)
     if not changed:
@@ -552,8 +561,13 @@ def cmd_proxy_config_set(
         print(f"  {key} = {value}")
 
     runtime = proxy_runtime_status(data)
-    if runtime["running"] and any(key in changed for key in ("host", "port")):
-        print(t("proxy is running; host/port changes apply after restart", "代理正在运行；host/port 变更会在重启后生效"))
+    if runtime["running"] and any(key in changed for key in ("host", "port", "max_body_mb")):
+        print(
+            t(
+                "proxy is running; host/port/max_body_mb changes apply after restart",
+                "代理正在运行；host/port/max_body_mb 变更会在重启后生效",
+            )
+        )
     return 0
 
 
@@ -569,6 +583,11 @@ def cmd_proxy_run(host: str | None, port: int | None) -> int:
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.info(
+        "starting proxy with max_body_mb=%s (%s bytes)",
+        data["proxy"].get("max_body_mb", 64),
+        proxy_max_body_bytes(data),
     )
     asyncio.run(run_proxy(data["proxy"]["host"], data["proxy"]["port"]))
     return 0
@@ -640,6 +659,7 @@ def main(argv: list[str] | None = None) -> None:
                             args.port,
                             args.auto_failover,
                             args.cooldown_sec,
+                            args.max_body_mb,
                         )
                     )
             if args.proxy_command == "run":

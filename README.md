@@ -104,6 +104,7 @@ ccproxy proxy status
 ccproxy health
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
+ccproxy proxy config set --max-body-mb 128
 ccproxy proxy config set --auto-failover off
 ```
 
@@ -112,7 +113,10 @@ ccproxy proxy config set --auto-failover off
 
 `cooldown_sec` 的意思是：某个 provider 刚失败后，先把它放冷一段时间，再允许重新尝试，避免在坏节点之间来回抖动。
 
+`max_body_mb` 是本地代理允许接收的最大请求体大小，默认是 `64` MiB。这个值主要用来避免 `aiohttp` 默认 `1` MiB 上限把大上下文请求提前拦死。
+
 `ccproxy proxy status` 不只会看 pid 文件，也会看本地健康探针，所以如果你是用 `systemd` 托管代理，它现在也能正确显示为运行中。
+如果你修改了 `host`、`port` 或 `max_body_mb`，需要重启代理进程后才会生效。
 
 ### 4. 用代理模式启动 Codex / Claude
 
@@ -221,6 +225,7 @@ ccproxy proxy status
 ccproxy proxy logs
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
+ccproxy proxy config set --max-body-mb 128
 ccproxy proxy config set --auto-failover off
 ccproxy completion zsh
 ccproxy completion bash
