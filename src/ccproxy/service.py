@@ -5,6 +5,7 @@ import os
 import pwd
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -19,6 +20,10 @@ def user_home(username: str | None = None) -> Path:
 
 
 def resolve_ccproxy_executable() -> Path:
+    argv0 = Path(sys.argv[0]).expanduser()
+    if argv0.is_absolute() and argv0.exists():
+        return argv0.resolve()
+
     found = shutil.which("ccproxy")
     if not found:
         raise FileNotFoundError("could not find `ccproxy` in PATH")
