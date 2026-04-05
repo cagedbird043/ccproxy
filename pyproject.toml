@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ccproxy"
+version = "0.1.0"
+description = "Hot-switch local proxy and launcher for Codex and Claude CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "cagedbird" }
+]
+dependencies = [
+  "aiohttp>=3.11,<4",
+]
+
+[project.scripts]
+ccproxy = "ccproxy.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ccproxy"]
