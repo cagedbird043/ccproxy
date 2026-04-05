@@ -1,6 +1,11 @@
 from ccproxy.checks import next_provider_candidates
 from ccproxy.config import resolve_provider_selector
-from ccproxy.proxy import build_upstream_url, classify_request
+from ccproxy.proxy import (
+    build_upstream_url,
+    classify_request,
+    provider_attempt_order,
+    should_failover_status,
+)
 
 
 def test_resolve_provider_selector_prefers_id() -> None:
@@ -49,3 +54,28 @@ def test_next_provider_candidates_rotate_after_current() -> None:
     }
     rotated = next_provider_candidates(data, "codex")
     assert [provider_id for provider_id, _provider in rotated] == ["c", "a", "b"]
+
+
+def test_provider_attempt_order_keeps_current_first() -> None:
+    data = {
+        "apps": {
+            "codex": {
+                "current": "b",
+                "providers": {
+                    "a": {"name": "A"},
+                    "b": {"name": "B"},
+                    "c": {"name": "C"},
+                },
+            },
+            "claude": {"current": None, "providers": {}},
+        }
+    }
+    ordered = provider_attempt_order(data, "codex")
+    assert [provider_id for provider_id, _provider in ordered] == ["b", "c", "a"]
+
+
+def test_should_failover_status_is_conservative() -> None:
+    assert should_failover_status(429) is True
+    assert should_failover_status(503) is True
+    assert should_failover_status(401) is False
+    assert should_failover_status(400) is False

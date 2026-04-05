@@ -252,6 +252,7 @@ def cmd_proxy_status() -> int:
     state = "running" if status["running"] else "stopped"
     print(f"proxy: {state}")
     print(f"listen: http://{status['host']}:{status['port']}")
+    print(f"auto failover: {'enabled' if status['auto_failover'] else 'disabled'}")
     if status["pid"]:
         print(f"pid: {status['pid']}")
     print(f"log: {status['log_path']}")

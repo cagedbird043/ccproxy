@@ -25,6 +25,7 @@ MVP 只支持：
 - `Codex`
 - `Claude`
 - provider 导入、列出、切换
+- proxy 内自动故障转移
 - 本地 proxy 前台/后台运行
 - `codex` / `claude` 临时启动器
 - 从现有 `cc-switch` 数据库导入 provider
@@ -85,6 +86,8 @@ ccproxy check claude
 ccproxy proxy up
 ccproxy proxy status
 ```
+
+默认会开启自动故障转移。当前 provider 如果在请求时连接失败，或者返回 `429/5xx`，proxy 会自动尝试下一个 provider，并把 current 更新为新的健康 provider。
 
 ### 4. 用代理模式启动 Codex / Claude
 

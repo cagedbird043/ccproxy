@@ -6,9 +6,9 @@ import signal
 from typing import Any
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
-from ccproxy.config import current_provider, load_config
+from ccproxy.config import current_provider, current_provider_id, load_config, save_config
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -21,6 +21,8 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+FAILOVER_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def build_upstream_url(base_url: str, request_path: str, query_string: str = "") -> str:
@@ -82,6 +84,43 @@ def build_forward_headers(
     return headers
 
 
+def should_failover_status(status_code: int) -> bool:
+    return status_code in FAILOVER_STATUS_CODES
+
+
+def provider_attempt_order(
+    config: dict[str, Any],
+    app: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    providers = config["apps"][app]["providers"]
+    if not providers:
+        raise ValueError(f"no providers configured for {app}")
+
+    items = list(providers.items())
+    current_id = current_provider_id(config, app)
+    if not current_id:
+        return items
+
+    index = next(
+        (idx for idx, (provider_id, _provider) in enumerate(items) if provider_id == current_id),
+        None,
+    )
+    if index is None:
+        return items
+    return items[index:] + items[:index]
+
+
+def persist_failover_selection(
+    config: dict[str, Any],
+    app: str,
+    provider_id: str,
+) -> None:
+    if config["apps"][app]["current"] == provider_id:
+        return
+    config["apps"][app]["current"] = provider_id
+    save_config(config)
+
+
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
@@ -99,36 +138,91 @@ async def forward(request: web.Request) -> web.StreamResponse:
 
     app, upstream_path = classified
     config = load_config()
-    provider_id, provider = current_provider(config, app)
-    upstream_url = build_upstream_url(
-        provider["base_url"], upstream_path, request.query_string
-    )
-    logging.info("proxy %s -> %s (%s)", request.path_qs, upstream_url, provider_id)
-
     body = await request.read()
-    headers = build_forward_headers(request.headers, app, provider)
     session: ClientSession = request.app["session"]
+    auto_failover = bool(config["proxy"].get("auto_failover", True))
+    attempts = provider_attempt_order(config, app)
+    last_error: str | None = None
 
-    async with session.request(
-        request.method,
-        upstream_url,
-        headers=headers,
-        data=body,
-    ) as upstream:
-        response_headers = {
-            key: value
-            for key, value in upstream.headers.items()
-            if key.lower() not in HOP_BY_HOP_HEADERS
-        }
-        response = web.StreamResponse(
-            status=upstream.status,
-            headers=response_headers,
+    for attempt_index, (provider_id, provider) in enumerate(attempts):
+        upstream_url = build_upstream_url(
+            provider["base_url"], upstream_path, request.query_string
         )
-        await response.prepare(request)
-        async for chunk in upstream.content.iter_chunked(64 * 1024):
-            await response.write(chunk)
-        await response.write_eof()
-        return response
+        headers = build_forward_headers(request.headers, app, provider)
+        logging.info("proxy %s -> %s (%s)", request.path_qs, upstream_url, provider_id)
+
+        try:
+            async with session.request(
+                request.method,
+                upstream_url,
+                headers=headers,
+                data=body,
+            ) as upstream:
+                can_failover = (
+                    auto_failover
+                    and attempt_index + 1 < len(attempts)
+                    and should_failover_status(upstream.status)
+                )
+                if can_failover:
+                    last_error = f"upstream status {upstream.status}"
+                    logging.warning(
+                        "provider %s returned %s for %s, trying next provider",
+                        provider_id,
+                        upstream.status,
+                        request.path_qs,
+                    )
+                    await upstream.read()
+                    continue
+
+                if attempt_index > 0:
+                    persist_failover_selection(config, app, provider_id)
+                    logging.warning(
+                        "auto failover switched %s current provider to %s",
+                        app,
+                        provider_id,
+                    )
+
+                response_headers = {
+                    key: value
+                    for key, value in upstream.headers.items()
+                    if key.lower() not in HOP_BY_HOP_HEADERS
+                }
+                response = web.StreamResponse(
+                    status=upstream.status,
+                    headers=response_headers,
+                )
+                await response.prepare(request)
+                async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    await response.write(chunk)
+                await response.write_eof()
+                return response
+        except (ClientError, asyncio.TimeoutError, OSError) as exc:
+            last_error = str(exc)
+            can_failover = auto_failover and attempt_index + 1 < len(attempts)
+            if can_failover:
+                logging.warning(
+                    "provider %s request failed for %s: %s; trying next provider",
+                    provider_id,
+                    request.path_qs,
+                    exc,
+                )
+                continue
+            return web.json_response(
+                {
+                    "error": "upstream request failed",
+                    "provider_id": provider_id,
+                    "detail": str(exc),
+                },
+                status=502,
+            )
+
+    return web.json_response(
+        {
+            "error": "all providers failed",
+            "detail": last_error or "unknown upstream failure",
+        },
+        status=502,
+    )
 
 
 def make_app() -> web.Application:
@@ -139,7 +233,7 @@ def make_app() -> web.Application:
 
 
 async def run_proxy(host: str, port: int) -> None:
-    timeout = ClientTimeout(total=None)
+    timeout = ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=180)
     app = make_app()
     app["session"] = ClientSession(timeout=timeout, auto_decompress=False)
 

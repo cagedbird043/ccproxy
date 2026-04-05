@@ -52,6 +52,7 @@ def default_config() -> dict[str, Any]:
         "proxy": {
             "host": "127.0.0.1",
             "port": 15721,
+            "auto_failover": True,
         },
         "apps": {
             app: {
@@ -196,6 +197,7 @@ def proxy_runtime_status(data: dict[str, Any]) -> dict[str, Any]:
         "pid": pid,
         "host": data["proxy"]["host"],
         "port": data["proxy"]["port"],
+        "auto_failover": bool(data["proxy"].get("auto_failover", True)),
         "log_path": str(log_path()),
     }
 
