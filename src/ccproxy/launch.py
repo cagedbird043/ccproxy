@@ -124,6 +124,12 @@ def _run_with_exit_code(cmd: list[str], env: dict[str, str] | None = None) -> in
     return int(completed.returncode)
 
 
+def _runtime_dir() -> Path:
+    runtime_dir = state_dir() / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
 def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
 
@@ -187,7 +193,7 @@ def launch_codex(selector: str | None, extra_args: list[str]) -> int:
     _, provider = set_current_provider(data, "codex", current_provider_id(data, "codex"))
     save_config(data)
 
-    with tempfile.TemporaryDirectory(prefix="ccproxy-codex-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="ccproxy-codex-", dir=_runtime_dir()) as temp_dir:
         temp_home = Path(temp_dir)
         _prepare_codex_temp_home(temp_home)
         (temp_home / "config.toml").write_text(_codex_proxy_config(provider.get("model")))
@@ -217,6 +223,7 @@ def launch_claude(selector: str | None, extra_args: list[str]) -> int:
         mode="w",
         prefix="ccproxy-claude-",
         suffix=".json",
+        dir=_runtime_dir(),
         delete=False,
     ) as handle:
         settings_path = Path(handle.name)
