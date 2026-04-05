@@ -1,13 +1,15 @@
 from pathlib import Path
 
+from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
 from ccproxy.config import resolve_provider_selector
-from ccproxy.proxy import (
-    build_upstream_url,
-    classify_request,
-    provider_attempt_order,
-    should_failover_status,
+from ccproxy.health_store import (
+    default_health_state,
+    record_failure,
+    record_success,
+    reorder_providers_by_cooldown,
 )
+from ccproxy.proxy import provider_attempt_order, should_failover_status
 from ccproxy.service import build_unit
 
 
@@ -31,14 +33,26 @@ def test_build_upstream_url_appends_v1_path() -> None:
     assert url == "https://example.com/v1/messages"
 
 
-def test_classify_request_maps_codex_aliases() -> None:
-    assert classify_request("/responses") == ("codex", "/v1/responses")
-    assert classify_request("/chat/completions") == ("codex", "/v1/chat/completions")
+def test_route_request_maps_codex_aliases() -> None:
+    assert route_request("/responses") == route_request("/responses").__class__(
+        app="codex",
+        upstream_path="/v1/responses",
+    )
+    assert route_request("/chat/completions") == route_request("/chat/completions").__class__(
+        app="codex",
+        upstream_path="/v1/chat/completions",
+    )
 
 
-def test_classify_request_maps_claude_aliases() -> None:
-    assert classify_request("/v1/messages") == ("claude", "/v1/messages")
-    assert classify_request("/claude/v1/messages") == ("claude", "/v1/messages")
+def test_route_request_maps_claude_aliases() -> None:
+    assert route_request("/v1/messages") == route_request("/v1/messages").__class__(
+        app="claude",
+        upstream_path="/v1/messages",
+    )
+    assert route_request("/claude/v1/messages") == route_request("/claude/v1/messages").__class__(
+        app="claude",
+        upstream_path="/v1/messages",
+    )
 
 
 def test_next_provider_candidates_rotate_after_current() -> None:
@@ -61,6 +75,7 @@ def test_next_provider_candidates_rotate_after_current() -> None:
 
 def test_provider_attempt_order_keeps_current_first() -> None:
     data = {
+        "proxy": {"cooldown_sec": 60},
         "apps": {
             "codex": {
                 "current": "b",
@@ -73,7 +88,7 @@ def test_provider_attempt_order_keeps_current_first() -> None:
             "claude": {"current": None, "providers": {}},
         }
     }
-    ordered = provider_attempt_order(data, "codex")
+    ordered = provider_attempt_order(data, default_health_state(), "codex")
     assert [provider_id for provider_id, _provider in ordered] == ["b", "c", "a"]
 
 
@@ -82,6 +97,39 @@ def test_should_failover_status_is_conservative() -> None:
     assert should_failover_status(503) is True
     assert should_failover_status(401) is False
     assert should_failover_status(400) is False
+
+
+def test_reorder_providers_moves_cooling_provider_to_end() -> None:
+    state = default_health_state()
+    record_failure(
+        state,
+        "claude",
+        "a",
+        "A",
+        "boom",
+        cooldown_sec=60,
+        now_ts=100.0,
+    )
+    items = [("a", {"name": "A"}), ("b", {"name": "B"})]
+    reordered = reorder_providers_by_cooldown(items, state, "claude", now_ts=101.0)
+    assert [provider_id for provider_id, _provider in reordered] == ["b", "a"]
+
+
+def test_record_success_clears_cooldown() -> None:
+    state = default_health_state()
+    record_failure(
+        state,
+        "codex",
+        "a",
+        "A",
+        "boom",
+        cooldown_sec=60,
+        now_ts=100.0,
+    )
+    record_success(state, "codex", "a", "A", now_ts=120.0)
+    entry = state["apps"]["codex"]["a"]
+    assert entry["cooldown_until"] is None
+    assert entry["consecutive_failures"] == 0
 
 
 def test_build_user_unit_contains_user_manager_target() -> None:

@@ -26,6 +26,7 @@ MVP 只支持：
 - `Claude`
 - provider 导入、列出、切换
 - proxy 内自动故障转移
+- 失败冷却和运行期健康状态
 - 本地 proxy 前台/后台运行
 - `codex` / `claude` 临时启动器
 - 从现有 `cc-switch` 数据库导入 provider
@@ -78,6 +79,7 @@ ccproxy list codex
 ccproxy list claude
 ccproxy check codex
 ccproxy check claude
+ccproxy health
 ```
 
 ### 3. 启动本地 proxy
@@ -85,9 +87,11 @@ ccproxy check claude
 ```bash
 ccproxy proxy up
 ccproxy proxy status
+ccproxy health
 ```
 
 默认会开启自动故障转移。当前 provider 如果在请求时连接失败，或者返回 `429/5xx`，proxy 会自动尝试下一个 provider，并把 current 更新为新的健康 provider。
+同时 proxy 会记录每个 provider 的成功/失败次数、最后错误和冷却时间。
 
 ### 4. 用代理模式启动 Codex / Claude
 
@@ -162,6 +166,8 @@ ccproxy proxy up
 ccproxy proxy down
 ccproxy proxy status
 ccproxy proxy logs
+ccproxy health
+ccproxy health claude
 ccproxy service install --scope user --enable-now
 ccproxy service print --scope system --user "$USER"
 

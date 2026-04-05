@@ -3,12 +3,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from typing import Any
-from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
-from ccproxy.config import current_provider, current_provider_id, load_config, save_config
+from ccproxy.adapters import ADAPTERS_BY_APP, build_upstream_url, route_request
+from ccproxy.config import current_provider_id, load_config, save_config
+from ccproxy.health_store import (
+    load_health_state,
+    record_failure,
+    record_success,
+    reorder_providers_by_cooldown,
+    save_health_state,
+)
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -25,71 +33,13 @@ HOP_BY_HOP_HEADERS = {
 FAILOVER_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
-def build_upstream_url(base_url: str, request_path: str, query_string: str = "") -> str:
-    parsed = urlsplit(base_url)
-    base_path = parsed.path.rstrip("/")
-    if base_path.endswith("/v1") and request_path.startswith("/v1/"):
-        final_path = base_path + request_path[3:]
-    elif base_path and request_path.startswith(base_path + "/"):
-        final_path = request_path
-    else:
-        final_path = f"{base_path}{request_path}" if base_path else request_path
-
-    result = SplitResult(
-        scheme=parsed.scheme,
-        netloc=parsed.netloc,
-        path=final_path,
-        query=query_string,
-        fragment="",
-    )
-    return urlunsplit(result)
-
-
-def classify_request(path: str) -> tuple[str, str] | None:
-    if path.startswith("/claude/"):
-        return "claude", path[len("/claude") :]
-    if path == "/v1/messages":
-        return "claude", path
-    if path in {"/responses", "/chat/completions"}:
-        return "codex", f"/v1{path}"
-    if path.startswith("/v1/"):
-        return "codex", path
-    return None
-
-
-def build_forward_headers(
-    request_headers: Any,
-    app: str,
-    provider: dict[str, Any],
-) -> dict[str, str]:
-    headers = {
-        key: value
-        for key, value in request_headers.items()
-        if key.lower() not in {"host", "authorization", "x-api-key", "content-length"}
-    }
-
-    api_key = provider["api_key"]
-    auth_mode = provider.get("auth_mode", "bearer")
-    if app == "codex":
-        headers["Authorization"] = f"Bearer {api_key}"
-        return headers
-
-    if auth_mode == "x-api-key":
-        headers["x-api-key"] = api_key
-    elif auth_mode == "both":
-        headers["Authorization"] = f"Bearer {api_key}"
-        headers["x-api-key"] = api_key
-    else:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
-
-
 def should_failover_status(status_code: int) -> bool:
     return status_code in FAILOVER_STATUS_CODES
 
 
 def provider_attempt_order(
     config: dict[str, Any],
+    health_state: dict[str, Any],
     app: str,
 ) -> list[tuple[str, dict[str, Any]]]:
     providers = config["apps"][app]["providers"]
@@ -106,8 +56,9 @@ def provider_attempt_order(
         None,
     )
     if index is None:
-        return items
-    return items[index:] + items[:index]
+        return reorder_providers_by_cooldown(items, health_state, app)
+    ordered = items[index:] + items[:index]
+    return reorder_providers_by_cooldown(ordered, health_state, app)
 
 
 def persist_failover_selection(
@@ -121,13 +72,24 @@ def persist_failover_selection(
     save_config(config)
 
 
+async def _update_health_state(
+    request: web.Request,
+    updater,
+) -> None:
+    lock: asyncio.Lock = request.app["health_lock"]
+    async with lock:
+        health_state = request.app["health_state"]
+        updater(health_state)
+        save_health_state(health_state)
+
+
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
 async def forward(request: web.Request) -> web.StreamResponse:
-    classified = classify_request(request.path)
-    if classified is None:
+    routed = route_request(request.path)
+    if routed is None:
         return web.json_response(
             {
                 "error": "unsupported path",
@@ -136,19 +98,23 @@ async def forward(request: web.Request) -> web.StreamResponse:
             status=404,
         )
 
-    app, upstream_path = classified
+    app = routed.app
+    upstream_path = routed.upstream_path
+    adapter = ADAPTERS_BY_APP[app]
     config = load_config()
+    health_state = request.app["health_state"]
     body = await request.read()
     session: ClientSession = request.app["session"]
     auto_failover = bool(config["proxy"].get("auto_failover", True))
-    attempts = provider_attempt_order(config, app)
+    cooldown_sec = int(config["proxy"].get("cooldown_sec", 60))
+    attempts = provider_attempt_order(config, health_state, app)
     last_error: str | None = None
 
     for attempt_index, (provider_id, provider) in enumerate(attempts):
         upstream_url = build_upstream_url(
             provider["base_url"], upstream_path, request.query_string
         )
-        headers = build_forward_headers(request.headers, app, provider)
+        headers = adapter.build_headers(request.headers, provider)
         logging.info("proxy %s -> %s (%s)", request.path_qs, upstream_url, provider_id)
 
         try:
@@ -165,6 +131,18 @@ async def forward(request: web.Request) -> web.StreamResponse:
                 )
                 if can_failover:
                     last_error = f"upstream status {upstream.status}"
+                    await _update_health_state(
+                        request,
+                        lambda state: record_failure(
+                            state,
+                            app,
+                            provider_id,
+                            provider.get("name", provider_id),
+                            last_error or "",
+                            cooldown_sec,
+                            now_ts=time.time(),
+                        ),
+                    )
                     logging.warning(
                         "provider %s returned %s for %s, trying next provider",
                         provider_id,
@@ -180,6 +158,17 @@ async def forward(request: web.Request) -> web.StreamResponse:
                         "auto failover switched %s current provider to %s",
                         app,
                         provider_id,
+                    )
+                if 200 <= upstream.status < 300:
+                    await _update_health_state(
+                        request,
+                        lambda state: record_success(
+                            state,
+                            app,
+                            provider_id,
+                            provider.get("name", provider_id),
+                            now_ts=time.time(),
+                        ),
                     )
 
                 response_headers = {
@@ -198,6 +187,18 @@ async def forward(request: web.Request) -> web.StreamResponse:
                 return response
         except (ClientError, asyncio.TimeoutError, OSError) as exc:
             last_error = str(exc)
+            await _update_health_state(
+                request,
+                lambda state: record_failure(
+                    state,
+                    app,
+                    provider_id,
+                    provider.get("name", provider_id),
+                    last_error or "",
+                    cooldown_sec,
+                    now_ts=time.time(),
+                ),
+            )
             can_failover = auto_failover and attempt_index + 1 < len(attempts)
             if can_failover:
                 logging.warning(
@@ -236,6 +237,8 @@ async def run_proxy(host: str, port: int) -> None:
     timeout = ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=180)
     app = make_app()
     app["session"] = ClientSession(timeout=timeout, auto_decompress=False)
+    app["health_state"] = load_health_state()
+    app["health_lock"] = asyncio.Lock()
 
     stop_event = asyncio.Event()
 

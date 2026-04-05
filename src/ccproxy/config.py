@@ -41,6 +41,10 @@ def log_path() -> Path:
     return state_dir() / "proxy.log"
 
 
+def health_state_path() -> Path:
+    return state_dir() / "health.json"
+
+
 def ensure_dirs() -> None:
     config_dir().mkdir(parents=True, exist_ok=True)
     state_dir().mkdir(parents=True, exist_ok=True)
@@ -53,6 +57,7 @@ def default_config() -> dict[str, Any]:
             "host": "127.0.0.1",
             "port": 15721,
             "auto_failover": True,
+            "cooldown_sec": 60,
         },
         "apps": {
             app: {
@@ -198,7 +203,9 @@ def proxy_runtime_status(data: dict[str, Any]) -> dict[str, Any]:
         "host": data["proxy"]["host"],
         "port": data["proxy"]["port"],
         "auto_failover": bool(data["proxy"].get("auto_failover", True)),
+        "cooldown_sec": int(data["proxy"].get("cooldown_sec", 60)),
         "log_path": str(log_path()),
+        "health_path": str(health_state_path()),
     }
 
 

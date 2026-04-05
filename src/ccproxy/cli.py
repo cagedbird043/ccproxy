@@ -11,6 +11,7 @@ from ccproxy.checks import next_provider_candidates, run_check
 from ccproxy.config import (
     APP_CHOICES,
     current_provider,
+    health_state_path,
     current_provider_id,
     init_config,
     load_config,
@@ -22,6 +23,7 @@ from ccproxy.config import (
     tail_file,
     upsert_provider,
 )
+from ccproxy.health_store import ensure_provider_entry, format_timestamp, load_health_state, provider_in_cooldown
 from ccproxy.importers import import_from_cc_switch
 from ccproxy.launch import (
     launch_claude,
@@ -85,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotate to the next healthy provider. Failed candidates are skipped automatically.",
     )
     next_parser.add_argument("app", choices=APP_CHOICES)
+
+    health_parser = sub.add_parser(
+        "health",
+        help="Show runtime provider health and cooldown state recorded by the proxy.",
+    )
+    health_parser.add_argument("app", nargs="?", choices=APP_CHOICES)
 
     service_parser = sub.add_parser("service", help="Install or print a systemd service for boot-time startup.")
     service_sub = service_parser.add_subparsers(dest="service_command", required=True)
@@ -278,9 +286,49 @@ def cmd_proxy_status() -> int:
     print(f"proxy: {state}")
     print(f"listen: http://{status['host']}:{status['port']}")
     print(f"auto failover: {'enabled' if status['auto_failover'] else 'disabled'}")
+    print(f"cooldown sec: {status['cooldown_sec']}")
     if status["pid"]:
         print(f"pid: {status['pid']}")
     print(f"log: {status['log_path']}")
+    print(f"health: {status['health_path']}")
+    return 0
+
+
+def cmd_health(app: str | None) -> int:
+    config = load_config()
+    state = load_health_state()
+    apps = [app] if app else list(APP_CHOICES)
+    for app_name in apps:
+        print(f"[{app_name}]")
+        providers = config["apps"][app_name]["providers"]
+        current = config["apps"][app_name]["current"]
+        if not providers:
+            print("  no providers configured")
+            continue
+        for provider_id, provider in providers.items():
+            entry = ensure_provider_entry(
+                state,
+                app_name,
+                provider_id,
+                provider.get("name", provider_id),
+            )
+            marker = "*" if provider_id == current else " "
+            status = "cooldown" if provider_in_cooldown(entry) else "ready"
+            print(
+                f"{marker} {provider_id:24} {provider.get('name', provider_id):24} "
+                f"{status:8} "
+                f"succ={entry['total_successes']} fail={entry['total_failures']} "
+                f"cfail={entry['consecutive_failures']}"
+            )
+            print(
+                f"  last_ok={format_timestamp(entry.get('last_success_at'))} "
+                f"last_fail={format_timestamp(entry.get('last_failure_at'))} "
+                f"cooldown_until={format_timestamp(entry.get('cooldown_until'))}"
+            )
+            if entry.get("last_error"):
+                print(f"  last_error={entry['last_error']}")
+    if apps:
+        print(f"health state file: {health_state_path()}")
     return 0
 
 
@@ -359,6 +407,9 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "next":
             raise SystemExit(cmd_next(args.app))
+
+        if args.command == "health":
+            raise SystemExit(cmd_health(args.app))
 
         if args.command == "service":
             if args.service_command == "install":
