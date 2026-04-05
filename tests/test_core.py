@@ -2,7 +2,7 @@ from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
-from ccproxy.cli import build_health_snapshot, detect_cli_lang, normalize_cli_argv
+from ccproxy.cli import build_health_snapshot, detect_cli_lang
 from ccproxy.config import default_config, proxy_runtime_status, resolve_provider_selector, update_proxy_config
 from ccproxy.health_store import (
     default_health_state,
@@ -141,25 +141,18 @@ def test_update_proxy_config_changes_cooldown_and_failover() -> None:
     assert data["proxy"]["auto_failover"] is False
 
 
-def test_normalize_cli_argv_supports_chinese_aliases() -> None:
-    argv, lang = normalize_cli_argv(["代理", "配置", "设置", "--auto-failover", "开", "--lang", "中文"])
-    assert argv == ["proxy", "config", "set", "--auto-failover", "on", "--lang", "zh"]
-    assert lang == "zh"
-
-
 def test_detect_cli_lang_prefers_locale_environment() -> None:
     lang = detect_cli_lang({"LANG": "zh_CN.UTF-8"})
     assert lang == "zh"
 
 
-def test_detect_cli_lang_prefers_override_over_locale() -> None:
-    lang = detect_cli_lang({"CCPROXY_LANG": "en", "LANG": "zh_CN.UTF-8"})
+def test_detect_cli_lang_prefers_lc_all_over_lang() -> None:
+    lang = detect_cli_lang({"LC_ALL": "en_US.UTF-8", "LANG": "zh_CN.UTF-8"})
     assert lang == "en"
 
 
-def test_explicit_lang_wins_over_chinese_aliases() -> None:
-    argv, lang = normalize_cli_argv(["--lang", "en", "代理", "状态"], env={"LANG": "zh_CN.UTF-8"})
-    assert argv == ["--lang", "en", "proxy", "status"]
+def test_detect_cli_lang_prefers_lc_messages_over_lang() -> None:
+    lang = detect_cli_lang({"LC_MESSAGES": "en_US.UTF-8", "LANG": "zh_CN.UTF-8"})
     assert lang == "en"
 
 

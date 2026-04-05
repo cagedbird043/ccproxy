@@ -46,53 +46,8 @@ LANG_ALIASES = {
     "zh-cn": "zh",
     "zh_cn": "zh",
     "cn": "zh",
-    "中文": "zh",
     "en": "en",
     "en-us": "en",
-}
-
-ARG_ALIASES = {
-    "--语言": "--lang",
-    "--版本": "--version",
-}
-
-COMMAND_ALIASES = {
-    "初始化": "init",
-    "导入": "import-cc-switch",
-    "导入ccswitch": "import-cc-switch",
-    "添加": "add",
-    "列表": "list",
-    "当前": "current",
-    "检查": "check",
-    "下一个": "next",
-    "轮换": "next",
-    "健康": "health",
-    "服务": "service",
-    "安装": "install",
-    "打印": "print",
-    "卸载": "uninstall",
-    "切换": "use",
-    "使用": "use",
-    "代理": "proxy",
-    "启动": "up",
-    "前台": "run",
-    "配置": "config",
-    "显示": "show",
-    "设置": "set",
-    "停止": "down",
-    "状态": "status",
-    "日志": "logs",
-}
-
-BOOL_ALIASES = {
-    "开": "on",
-    "启用": "on",
-    "打开": "on",
-    "on": "on",
-    "关": "off",
-    "禁用": "off",
-    "关闭": "off",
-    "off": "off",
 }
 
 
@@ -121,10 +76,6 @@ def canonical_lang(raw: str | None) -> str | None:
 
 def detect_cli_lang(env: dict[str, str] | None = None) -> str:
     env = env or os.environ
-    override = canonical_lang(env.get("CCPROXY_LANG"))
-    if override:
-        return override
-
     for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
         raw = env.get(key)
         normalized = canonical_lang(raw)
@@ -138,48 +89,6 @@ def detect_cli_lang(env: dict[str, str] | None = None) -> str:
     return "en"
 
 
-def normalize_cli_argv(argv: list[str], env: dict[str, str] | None = None) -> tuple[list[str], str]:
-    normalized: list[str] = []
-    detected_lang = detect_cli_lang(env)
-    explicit_lang = False
-    i = 0
-
-    while i < len(argv):
-        token = argv[i]
-        token = ARG_ALIASES.get(token, token)
-
-        if token == "--lang":
-            normalized.append(token)
-            if i + 1 < len(argv):
-                lang_value = canonical_lang(argv[i + 1]) or argv[i + 1]
-                normalized.append(lang_value)
-                detected_lang = lang_value
-                explicit_lang = True
-                i += 2
-                continue
-            i += 1
-            continue
-
-        mapped = COMMAND_ALIASES.get(token, token)
-        if mapped != token and not explicit_lang:
-            detected_lang = "zh"
-        token = mapped
-
-        if token == "--auto-failover" and i + 1 < len(argv):
-            normalized.append(token)
-            value = BOOL_ALIASES.get(argv[i + 1], argv[i + 1])
-            normalized.append(value)
-            if value != argv[i + 1] and not explicit_lang:
-                detected_lang = "zh"
-            i += 2
-            continue
-
-        normalized.append(token)
-        i += 1
-
-    return normalized, detected_lang
-
-
 def build_parser(lang: str = "en") -> argparse.ArgumentParser:
     global CLI_LANG
     CLI_LANG = lang
@@ -190,20 +99,13 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
             "给 Codex 和 Claude CLI 用的本地热切代理与启动器。",
         ),
     )
-    parser.add_argument(
-        "--lang",
-        choices=("en", "zh"),
-        default=lang,
-        help=t("CLI output language.", "CLI 输出语言。"),
-    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", aliases=["初始化"], help=t("Create config skeleton if missing.", "初始化配置骨架。"))
+    sub.add_parser("init", help=t("Create config skeleton if missing.", "初始化配置骨架。"))
 
     import_parser = sub.add_parser(
         "import-cc-switch",
-        aliases=["导入", "导入ccswitch"],
         help=t("Import codex/claude providers from ~/.cc-switch/cc-switch.db.", "从 ~/.cc-switch/cc-switch.db 导入 codex/claude provider。"),
     )
     import_parser.add_argument(
@@ -212,7 +114,7 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         help=t("Path to cc-switch.db.", "cc-switch.db 路径。"),
     )
 
-    add_parser = sub.add_parser("add", aliases=["添加"], help=t("Add a provider manually.", "手动添加 provider。"))
+    add_parser = sub.add_parser("add", help=t("Add a provider manually.", "手动添加 provider。"))
     add_parser.add_argument("app", choices=APP_CHOICES)
     add_parser.add_argument("id", help=t("Provider ID used inside ccproxy.", "ccproxy 内部使用的 provider ID。"))
     add_parser.add_argument("--name", help=t("Human-readable provider name.", "便于识别的 provider 名称。"))
@@ -230,35 +132,33 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         help=t("Set this provider as current immediately.", "添加后立刻设为当前 provider。"),
     )
 
-    list_parser = sub.add_parser("list", aliases=["列表"], help=t("List providers for an app.", "列出某个 app 的 provider。"))
+    list_parser = sub.add_parser("list", help=t("List providers for an app.", "列出某个 app 的 provider。"))
     list_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
 
-    current_parser = sub.add_parser("current", aliases=["当前"], help=t("Show current provider.", "显示当前 provider。"))
+    current_parser = sub.add_parser("current", help=t("Show current provider.", "显示当前 provider。"))
     current_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
 
-    check_parser = sub.add_parser("check", aliases=["检查"], help=t("Run a real non-interactive health check against a provider.", "对 provider 跑一次真实的非交互健康检查。"))
+    check_parser = sub.add_parser("check", help=t("Run a real non-interactive health check against a provider.", "对 provider 跑一次真实的非交互健康检查。"))
     check_parser.add_argument("app", choices=APP_CHOICES)
     check_parser.add_argument("provider", nargs="?", help=t("Provider ID first, then exact provider name. Defaults to current provider.", "优先传 provider ID，其次精确名称；默认检查当前 provider。"))
 
     next_parser = sub.add_parser(
         "next",
-        aliases=["下一个", "轮换"],
         help=t("Rotate to the next healthy provider. Failed candidates are skipped automatically.", "切到下一个健康 provider，失败候选会自动跳过。"),
     )
     next_parser.add_argument("app", choices=APP_CHOICES)
 
     health_parser = sub.add_parser(
         "health",
-        aliases=["健康"],
         help=t("Show runtime provider health and cooldown state recorded by the proxy.", "显示代理记录的运行期健康状态和冷却状态。"),
     )
     health_parser.add_argument("app", nargs="?", choices=APP_CHOICES)
     health_parser.add_argument("--json", action="store_true", help=t("Print health state as JSON.", "以 JSON 输出健康状态。"))
 
-    service_parser = sub.add_parser("service", aliases=["服务"], help=t("Install or print a systemd service for boot-time startup.", "安装或打印开机自启用的 systemd 服务。"))
+    service_parser = sub.add_parser("service", help=t("Install or print a systemd service for boot-time startup.", "安装或打印开机自启用的 systemd 服务。"))
     service_sub = service_parser.add_subparsers(dest="service_command", required=True)
 
-    service_install = service_sub.add_parser("install", aliases=["安装"], help=t("Install a systemd unit.", "安装 systemd unit。"))
+    service_install = service_sub.add_parser("install", help=t("Install a systemd unit.", "安装 systemd unit。"))
     service_install.add_argument("--scope", choices=("user", "system"), default="user")
     service_install.add_argument("--enable-now", action="store_true")
     service_install.add_argument(
@@ -267,7 +167,7 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         help=t("Target user for system scope units. Defaults to current user.", "system 级 unit 的目标用户，默认当前用户。"),
     )
 
-    service_print = service_sub.add_parser("print", aliases=["打印"], help=t("Print a systemd unit to stdout.", "把 systemd unit 打印到标准输出。"))
+    service_print = service_sub.add_parser("print", help=t("Print a systemd unit to stdout.", "把 systemd unit 打印到标准输出。"))
     service_print.add_argument("--scope", choices=("user", "system"), default="user")
     service_print.add_argument(
         "--user",
@@ -275,34 +175,34 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         help=t("Target user for system scope units. Defaults to current user.", "system 级 unit 的目标用户，默认当前用户。"),
     )
 
-    service_uninstall = service_sub.add_parser("uninstall", aliases=["卸载"], help=t("Remove an installed systemd unit.", "移除已安装的 systemd unit。"))
+    service_uninstall = service_sub.add_parser("uninstall", help=t("Remove an installed systemd unit.", "移除已安装的 systemd unit。"))
     service_uninstall.add_argument("--scope", choices=("user", "system"), default="user")
     service_uninstall.add_argument("--disable-now", action="store_true")
 
-    use_parser = sub.add_parser("use", aliases=["切换", "使用"], help=t("Switch current provider.", "切换当前 provider。"))
+    use_parser = sub.add_parser("use", help=t("Switch current provider.", "切换当前 provider。"))
     use_parser.add_argument("app", choices=APP_CHOICES)
     use_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
 
-    proxy_parser = sub.add_parser("proxy", aliases=["代理"], help=t("Manage the local proxy.", "管理本地代理。"))
+    proxy_parser = sub.add_parser("proxy", help=t("Manage the local proxy.", "管理本地代理。"))
     proxy_sub = proxy_parser.add_subparsers(dest="proxy_command", required=True)
 
-    proxy_up = proxy_sub.add_parser("up", aliases=["启动"], help=t("Start proxy in background.", "后台启动代理。"))
+    proxy_up = proxy_sub.add_parser("up", help=t("Start proxy in background.", "后台启动代理。"))
     proxy_up.add_argument("--host", help=t("Override listen host.", "覆盖监听 host。"))
     proxy_up.add_argument("--port", type=int, help=t("Override listen port.", "覆盖监听端口。"))
 
-    proxy_run = proxy_sub.add_parser("run", aliases=["前台"], help=t("Run proxy in foreground.", "以前台方式运行代理。"))
+    proxy_run = proxy_sub.add_parser("run", help=t("Run proxy in foreground.", "以前台方式运行代理。"))
     proxy_run.add_argument("--host", help=t("Override listen host.", "覆盖监听 host。"))
     proxy_run.add_argument("--port", type=int, help=t("Override listen port.", "覆盖监听端口。"))
 
-    proxy_config_parser = proxy_sub.add_parser("config", aliases=["配置"], help=t("Show or update persistent proxy settings.", "显示或更新持久化代理配置。"))
+    proxy_config_parser = proxy_sub.add_parser("config", help=t("Show or update persistent proxy settings.", "显示或更新持久化代理配置。"))
     proxy_config_sub = proxy_config_parser.add_subparsers(dest="proxy_config_command", required=True)
-    proxy_config_sub.add_parser("show", aliases=["显示"], help=t("Show persistent proxy settings.", "显示持久化代理配置。"))
-    proxy_config_set = proxy_config_sub.add_parser("set", aliases=["设置"], help=t("Update persistent proxy settings.", "更新持久化代理配置。"))
+    proxy_config_sub.add_parser("show", help=t("Show persistent proxy settings.", "显示持久化代理配置。"))
+    proxy_config_set = proxy_config_sub.add_parser("set", help=t("Update persistent proxy settings.", "更新持久化代理配置。"))
     proxy_config_set.add_argument("--host", help=t("Persist a new listen host.", "持久化新的监听 host。"))
     proxy_config_set.add_argument("--port", type=int, help=t("Persist a new listen port.", "持久化新的监听端口。"))
     proxy_config_set.add_argument(
         "--auto-failover",
-        choices=("on", "off", "开", "关", "启用", "禁用", "打开", "关闭"),
+        choices=("on", "off"),
         help=t("Enable or disable automatic failover.", "开启或关闭自动故障转移。"),
     )
     proxy_config_set.add_argument(
@@ -311,9 +211,9 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         help=t("Cooldown applied to a failed provider before it is tried again.", "失败 provider 在再次尝试前的冷却秒数。"),
     )
 
-    proxy_sub.add_parser("down", aliases=["停止"], help=t("Stop background proxy.", "停止后台代理。"))
-    proxy_sub.add_parser("status", aliases=["状态"], help=t("Show proxy status.", "显示代理状态。"))
-    proxy_sub.add_parser("logs", aliases=["日志"], help=t("Show recent proxy logs.", "显示最近的代理日志。"))
+    proxy_sub.add_parser("down", help=t("Stop background proxy.", "停止后台代理。"))
+    proxy_sub.add_parser("status", help=t("Show proxy status.", "显示代理状态。"))
+    proxy_sub.add_parser("logs", help=t("Show recent proxy logs.", "显示最近的代理日志。"))
 
     codex_parser = sub.add_parser(
         "codex",
@@ -654,12 +554,10 @@ def cmd_proxy_run(host: str | None, port: int | None) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    normalized_argv, lang = normalize_cli_argv(raw_argv)
-    parser = build_parser(lang)
-    args = parser.parse_args(normalized_argv)
+    parser = build_parser(detect_cli_lang())
+    args = parser.parse_args(argv)
     global CLI_LANG
-    CLI_LANG = args.lang
+    CLI_LANG = detect_cli_lang()
 
     try:
         if args.command == "init":

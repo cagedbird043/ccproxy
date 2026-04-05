@@ -157,31 +157,22 @@ ccproxy service print --scope system --user "$USER"
 
 ### 7. 中文 CLI
 
-`ccproxy` 支持中文命令别名，也支持中文输出：
+`ccproxy` 只做中文显示，不做中文命令、中文参数或中文取值。命令面始终保持英文。
+
+如果你的终端 locale 是中文，比如 `zh_CN.UTF-8`，`ccproxy` 会自动输出中文；如果 locale 是英文，就输出英文。
 
 ```bash
-ccproxy --lang zh 代理 状态
-ccproxy --lang zh 代理 配置 显示
-ccproxy --lang zh 健康 --json
-ccproxy --lang zh 切换 codex my-codex
-ccproxy --lang zh 下一个 claude
+LANG=zh_CN.UTF-8 ccproxy proxy status
+LANG=zh_CN.UTF-8 ccproxy health
 ```
 
 默认语言会按下面的优先级自动检测：
 
-1. `--lang`
-2. `CCPROXY_LANG`
-3. `LC_ALL`
-4. `LC_MESSAGES`
-5. `LANG`
+1. `LC_ALL`
+2. `LC_MESSAGES`
+3. `LANG`
 
 这和 Linux 常见 CLI 的思路一致，适合 SSH / tmux / Termux 这种环境。
-
-如果你想强制固定中文输出，也可以设置：
-
-```bash
-export CCPROXY_LANG=zh
-```
 
 ## 命令
 
@@ -205,9 +196,6 @@ ccproxy proxy logs
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
 ccproxy proxy config set --auto-failover off
-ccproxy --lang zh 代理 状态
-ccproxy --lang zh 代理 配置 显示
-ccproxy --lang zh 切换 codex my-codex
 ccproxy health
 ccproxy health --json
 ccproxy health claude
