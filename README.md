@@ -120,6 +120,29 @@ ccproxy next claude
 
 当前会话不会被重启。下一次发起请求时会走新 provider。
 
+### 6. 开机自启
+
+如果你只需要“登录后自动启动”，用用户态 service：
+
+```bash
+ccproxy service install --scope user --enable-now
+systemctl --user status ccproxy.service
+```
+
+如果你需要“开机后、登录前也可用”，用系统级 service：
+
+```bash
+sudo ccproxy service install --scope system --user "$USER" --enable-now
+sudo systemctl status ccproxy.service
+```
+
+也可以先只打印 unit 文件：
+
+```bash
+ccproxy service print --scope user
+ccproxy service print --scope system --user "$USER"
+```
+
 ## 命令
 
 ```bash
@@ -139,6 +162,8 @@ ccproxy proxy up
 ccproxy proxy down
 ccproxy proxy status
 ccproxy proxy logs
+ccproxy service install --scope user --enable-now
+ccproxy service print --scope system --user "$USER"
 
 ccproxy codex
 ccproxy codex --provider my-codex -- --model gpt-5.4

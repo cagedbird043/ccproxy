@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from ccproxy.checks import next_provider_candidates
 from ccproxy.config import resolve_provider_selector
 from ccproxy.proxy import (
@@ -6,6 +8,7 @@ from ccproxy.proxy import (
     provider_attempt_order,
     should_failover_status,
 )
+from ccproxy.service import build_unit
 
 
 def test_resolve_provider_selector_prefers_id() -> None:
@@ -79,3 +82,26 @@ def test_should_failover_status_is_conservative() -> None:
     assert should_failover_status(503) is True
     assert should_failover_status(401) is False
     assert should_failover_status(400) is False
+
+
+def test_build_user_unit_contains_user_manager_target() -> None:
+    unit = build_unit(
+        "user",
+        Path("/home/demo/.local/bin/ccproxy"),
+        "demo",
+        home=Path("/home/demo"),
+    )
+    assert "WantedBy=default.target" in unit
+    assert "ExecStart=/home/demo/.local/bin/ccproxy proxy run" in unit
+    assert "User=demo" not in unit
+
+
+def test_build_system_unit_contains_explicit_user() -> None:
+    unit = build_unit(
+        "system",
+        Path("/home/demo/.local/bin/ccproxy"),
+        "demo",
+        home=Path("/home/demo"),
+    )
+    assert "WantedBy=multi-user.target" in unit
+    assert "User=demo" in unit

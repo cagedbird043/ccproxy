@@ -30,6 +30,7 @@ from ccproxy.launch import (
     stop_proxy_background,
 )
 from ccproxy.proxy import run_proxy
+from ccproxy.service import build_unit, current_username, install_service, resolve_ccproxy_executable, uninstall_service
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +85,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotate to the next healthy provider. Failed candidates are skipped automatically.",
     )
     next_parser.add_argument("app", choices=APP_CHOICES)
+
+    service_parser = sub.add_parser("service", help="Install or print a systemd service for boot-time startup.")
+    service_sub = service_parser.add_subparsers(dest="service_command", required=True)
+
+    service_install = service_sub.add_parser("install", help="Install a systemd unit.")
+    service_install.add_argument("--scope", choices=("user", "system"), default="user")
+    service_install.add_argument("--enable-now", action="store_true")
+    service_install.add_argument(
+        "--user",
+        default=current_username(),
+        help="Target user for system scope units. Defaults to current user.",
+    )
+
+    service_print = service_sub.add_parser("print", help="Print a systemd unit to stdout.")
+    service_print.add_argument("--scope", choices=("user", "system"), default="user")
+    service_print.add_argument(
+        "--user",
+        default=current_username(),
+        help="Target user for system scope units. Defaults to current user.",
+    )
+
+    service_uninstall = service_sub.add_parser("uninstall", help="Remove an installed systemd unit.")
+    service_uninstall.add_argument("--scope", choices=("user", "system"), default="user")
+    service_uninstall.add_argument("--disable-now", action="store_true")
 
     use_parser = sub.add_parser("use", help="Switch current provider.")
     use_parser.add_argument("app", choices=APP_CHOICES)
@@ -259,6 +284,27 @@ def cmd_proxy_status() -> int:
     return 0
 
 
+def cmd_service_install(scope: str, enable_now: bool, username: str) -> int:
+    path = install_service(scope, enable_now, username)
+    print(f"installed {scope} service: {path}")
+    if scope == "user" and not enable_now:
+        print("enable it with: systemctl --user enable --now ccproxy.service")
+    if scope == "system" and not enable_now:
+        print("enable it with: sudo systemctl enable --now ccproxy.service")
+    return 0
+
+
+def cmd_service_print(scope: str, username: str) -> int:
+    print(build_unit(scope, resolve_ccproxy_executable(), username), end="")
+    return 0
+
+
+def cmd_service_uninstall(scope: str, disable_now: bool) -> int:
+    path = uninstall_service(scope, disable_now)
+    print(f"removed {scope} service: {path}")
+    return 0
+
+
 def cmd_proxy_logs() -> int:
     lines = tail_file(log_path())
     if not lines:
@@ -313,6 +359,14 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "next":
             raise SystemExit(cmd_next(args.app))
+
+        if args.command == "service":
+            if args.service_command == "install":
+                raise SystemExit(cmd_service_install(args.scope, args.enable_now, args.user))
+            if args.service_command == "print":
+                raise SystemExit(cmd_service_print(args.scope, args.user))
+            if args.service_command == "uninstall":
+                raise SystemExit(cmd_service_uninstall(args.scope, args.disable_now))
 
         if args.command == "use":
             raise SystemExit(cmd_use(args.app, args.selector))
