@@ -103,12 +103,45 @@ def t(en: str, zh: str) -> str:
 def canonical_lang(raw: str | None) -> str | None:
     if raw is None:
         return None
-    return LANG_ALIASES.get(raw.lower(), LANG_ALIASES.get(raw, raw))
+    value = raw.strip()
+    if not value:
+        return None
+
+    lower = value.lower()
+    alias = LANG_ALIASES.get(lower) or LANG_ALIASES.get(value)
+    if alias:
+        return alias
+
+    if lower.startswith("zh") or "hans" in lower or "hant" in lower or "chinese" in lower:
+        return "zh"
+    if lower.startswith("en"):
+        return "en"
+    return None
 
 
-def normalize_cli_argv(argv: list[str]) -> tuple[list[str], str]:
+def detect_cli_lang(env: dict[str, str] | None = None) -> str:
+    env = env or os.environ
+    override = canonical_lang(env.get("CCPROXY_LANG"))
+    if override:
+        return override
+
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        raw = env.get(key)
+        normalized = canonical_lang(raw)
+        if normalized:
+            return normalized
+        if raw:
+            lower = raw.strip().lower()
+            if lower in {"c", "posix"} or lower.startswith("c.") or lower.startswith("posix."):
+                return "en"
+            return "en"
+    return "en"
+
+
+def normalize_cli_argv(argv: list[str], env: dict[str, str] | None = None) -> tuple[list[str], str]:
     normalized: list[str] = []
-    detected_lang = canonical_lang(os.environ.get("CCPROXY_LANG")) or "en"
+    detected_lang = detect_cli_lang(env)
+    explicit_lang = False
     i = 0
 
     while i < len(argv):
@@ -121,13 +154,14 @@ def normalize_cli_argv(argv: list[str]) -> tuple[list[str], str]:
                 lang_value = canonical_lang(argv[i + 1]) or argv[i + 1]
                 normalized.append(lang_value)
                 detected_lang = lang_value
+                explicit_lang = True
                 i += 2
                 continue
             i += 1
             continue
 
         mapped = COMMAND_ALIASES.get(token, token)
-        if mapped != token:
+        if mapped != token and not explicit_lang:
             detected_lang = "zh"
         token = mapped
 
@@ -135,7 +169,7 @@ def normalize_cli_argv(argv: list[str]) -> tuple[list[str], str]:
             normalized.append(token)
             value = BOOL_ALIASES.get(argv[i + 1], argv[i + 1])
             normalized.append(value)
-            if value != argv[i + 1]:
+            if value != argv[i + 1] and not explicit_lang:
                 detected_lang = "zh"
             i += 2
             continue

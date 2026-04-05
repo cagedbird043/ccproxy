@@ -167,7 +167,17 @@ ccproxy --lang zh 切换 codex my-codex
 ccproxy --lang zh 下一个 claude
 ```
 
-如果你想长期默认中文输出，可以设置：
+默认语言会按下面的优先级自动检测：
+
+1. `--lang`
+2. `CCPROXY_LANG`
+3. `LC_ALL`
+4. `LC_MESSAGES`
+5. `LANG`
+
+这和 Linux 常见 CLI 的思路一致，适合 SSH / tmux / Termux 这种环境。
+
+如果你想强制固定中文输出，也可以设置：
 
 ```bash
 export CCPROXY_LANG=zh
