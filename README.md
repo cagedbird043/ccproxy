@@ -31,23 +31,35 @@ MVP 只支持：
 
 ## 安装
 
-开发安装：
+你不需要每次都写 `uv run`。
+
+推荐直接执行仓库自带安装脚本。它会创建一个独立虚拟环境，并把 `ccproxy` 链接到 `~/.local/bin/ccproxy`。
 
 ```bash
 cd ccproxy
-uv sync
+./install.sh
+ccproxy --help
 ```
 
-运行：
+如果你在本地开发这个仓库，希望改代码后命令立即生效：
 
 ```bash
-uv run ccproxy --help
+cd ccproxy
+CCPROXY_EDITABLE=1 ./install.sh
+ccproxy --help
 ```
 
-安装成命令：
+卸载：
+
+```bash
+./uninstall.sh
+```
+
+如果你本来就喜欢 `uv` 或 `pipx`，也可以：
 
 ```bash
 uv tool install .
+pipx install .
 ```
 
 ## 快速开始
@@ -55,35 +67,35 @@ uv tool install .
 ### 1. 从现有 cc-switch 导入 provider
 
 ```bash
-uv run ccproxy import-cc-switch
+ccproxy import-cc-switch
 ```
 
 ### 2. 看看当前有哪些 provider
 
 ```bash
-uv run ccproxy list codex
-uv run ccproxy list claude
+ccproxy list codex
+ccproxy list claude
 ```
 
 ### 3. 启动本地 proxy
 
 ```bash
-uv run ccproxy proxy up
-uv run ccproxy proxy status
+ccproxy proxy up
+ccproxy proxy status
 ```
 
 ### 4. 用代理模式启动 Codex / Claude
 
 ```bash
-uv run ccproxy codex
-uv run ccproxy claude
+ccproxy codex
+ccproxy claude
 ```
 
 如果你想在启动前切到指定 provider：
 
 ```bash
-uv run ccproxy codex --provider yescodex
-uv run ccproxy claude --provider ikun-1m
+ccproxy codex --provider yescodex
+ccproxy claude --provider ikun-1m
 ```
 
 ### 5. 运行中热切 provider
@@ -91,11 +103,11 @@ uv run ccproxy claude --provider ikun-1m
 在另一个终端里：
 
 ```bash
-uv run ccproxy use codex yescodex
-uv run ccproxy use codex backup-provider
+ccproxy use codex yescodex
+ccproxy use codex backup-provider
 
-uv run ccproxy use claude ikun-1m
-uv run ccproxy use claude fallback-claude
+ccproxy use claude ikun-1m
+ccproxy use claude fallback-claude
 ```
 
 当前会话不会被重启。下一次发起请求时会走新 provider。
@@ -157,3 +169,13 @@ ccproxy claude --provider my-claude -- --resume
 ## License
 
 MIT
+
+## 开发
+
+如果你是仓库开发者，继续用 `uv` 最方便：
+
+```bash
+uv sync --dev
+uv run python -m pytest -q
+uv run ccproxy import-cc-switch
+```
