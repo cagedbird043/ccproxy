@@ -2,8 +2,8 @@ from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
-from ccproxy.cli import build_health_snapshot
-from ccproxy.config import default_config, resolve_provider_selector, update_proxy_config
+from ccproxy.cli import build_health_snapshot, normalize_cli_argv
+from ccproxy.config import default_config, proxy_runtime_status, resolve_provider_selector, update_proxy_config
 from ccproxy.health_store import (
     default_health_state,
     record_failure,
@@ -139,6 +139,26 @@ def test_update_proxy_config_changes_cooldown_and_failover() -> None:
     assert changed == {"auto_failover": False, "cooldown_sec": 120}
     assert data["proxy"]["cooldown_sec"] == 120
     assert data["proxy"]["auto_failover"] is False
+
+
+def test_normalize_cli_argv_supports_chinese_aliases() -> None:
+    argv, lang = normalize_cli_argv(["代理", "配置", "设置", "--auto-failover", "开", "--lang", "中文"])
+    assert argv == ["proxy", "config", "set", "--auto-failover", "on", "--lang", "zh"]
+    assert lang == "zh"
+
+
+def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:
+    data = default_config()
+    monkeypatch.setattr("ccproxy.config.remove_stale_pid_file", lambda: None)
+    monkeypatch.setattr("ccproxy.config.pid_from_file", lambda: None)
+    monkeypatch.setattr("ccproxy.config.is_pid_running", lambda pid: False)
+    monkeypatch.setattr("ccproxy.config.proxy_health_ok", lambda host, port, timeout_sec=0.5: True)
+    monkeypatch.setattr("ccproxy.config.systemd_service_scope", lambda: "system")
+
+    status = proxy_runtime_status(data)
+    assert status["running"] is True
+    assert status["healthy"] is True
+    assert status["manager"] == "systemd-system"
 
 
 def test_build_health_snapshot_has_file_and_rows() -> None:

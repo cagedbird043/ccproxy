@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
+
+from ccproxy.service import systemd_service_scope
 
 APP_CHOICES = ("codex", "claude")
 
@@ -234,18 +238,44 @@ def remove_stale_pid_file() -> None:
         pid_path().unlink(missing_ok=True)
 
 
+def proxy_health_ok(host: str, port: int, timeout_sec: float = 0.5) -> bool:
+    url = f"http://{host}:{port}/__ccproxy/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_sec) as response:
+            return response.status == 200
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
 def proxy_runtime_status(data: dict[str, Any]) -> dict[str, Any]:
     remove_stale_pid_file()
     pid = pid_from_file()
+    host = data["proxy"]["host"]
+    port = data["proxy"]["port"]
+    pid_running = is_pid_running(pid)
+    health_ok = proxy_health_ok(host, port)
+    systemd_scope = systemd_service_scope()
+
+    manager = None
+    if pid_running:
+        manager = "pidfile"
+    elif systemd_scope:
+        manager = f"systemd-{systemd_scope}"
+    elif health_ok:
+        manager = "external"
+
     return {
-        "running": is_pid_running(pid),
+        "running": pid_running or health_ok,
         "pid": pid,
-        "host": data["proxy"]["host"],
-        "port": data["proxy"]["port"],
+        "host": host,
+        "port": port,
         "auto_failover": bool(data["proxy"].get("auto_failover", True)),
         "cooldown_sec": int(data["proxy"].get("cooldown_sec", 60)),
         "log_path": str(log_path()),
         "health_path": str(health_state_path()),
+        "healthy": health_ok,
+        "manager": manager,
+        "systemd_scope": systemd_scope,
     }
 
 

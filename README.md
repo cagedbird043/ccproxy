@@ -99,6 +99,8 @@ ccproxy proxy config set --auto-failover off
 
 `cooldown_sec` 的意思是：某个 provider 刚失败后，先把它放冷一段时间，再允许重新尝试，避免在坏节点之间来回抖动。
 
+`ccproxy proxy status` 不只会看 pid 文件，也会看本地健康探针，所以如果你是用 `systemd` 托管代理，它现在也能正确显示为运行中。
+
 ### 4. 用代理模式启动 Codex / Claude
 
 ```bash
@@ -153,6 +155,24 @@ ccproxy service print --scope user
 ccproxy service print --scope system --user "$USER"
 ```
 
+### 7. 中文 CLI
+
+`ccproxy` 支持中文命令别名，也支持中文输出：
+
+```bash
+ccproxy --lang zh 代理 状态
+ccproxy --lang zh 代理 配置 显示
+ccproxy --lang zh 健康 --json
+ccproxy --lang zh 切换 codex my-codex
+ccproxy --lang zh 下一个 claude
+```
+
+如果你想长期默认中文输出，可以设置：
+
+```bash
+export CCPROXY_LANG=zh
+```
+
 ## 命令
 
 ```bash
@@ -175,6 +195,9 @@ ccproxy proxy logs
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
 ccproxy proxy config set --auto-failover off
+ccproxy --lang zh 代理 状态
+ccproxy --lang zh 代理 配置 显示
+ccproxy --lang zh 切换 codex my-codex
 ccproxy health
 ccproxy health --json
 ccproxy health claude

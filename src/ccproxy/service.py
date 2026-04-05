@@ -30,6 +30,31 @@ def resolve_ccproxy_executable() -> Path:
     return Path(found).resolve()
 
 
+def systemd_service_scope() -> str | None:
+    if not shutil.which("systemctl"):
+        return None
+
+    system = subprocess.run(
+        ["systemctl", "is-active", "ccproxy.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if system.returncode == 0 and system.stdout.strip() == "active":
+        return "system"
+
+    user = subprocess.run(
+        ["systemctl", "--user", "is-active", "ccproxy.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if user.returncode == 0 and user.stdout.strip() == "active":
+        return "user"
+
+    return None
+
+
 def unit_path(scope: str) -> Path:
     if scope == "user":
         return Path.home() / ".config/systemd/user/ccproxy.service"
