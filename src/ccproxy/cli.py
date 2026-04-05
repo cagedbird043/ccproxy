@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -17,10 +18,12 @@ from ccproxy.config import (
     load_config,
     log_path,
     normalize_app,
+    proxy_config,
     proxy_runtime_status,
     save_config,
     set_current_provider,
     tail_file,
+    update_proxy_config,
     upsert_provider,
 )
 from ccproxy.health_store import ensure_provider_entry, format_timestamp, load_health_state, provider_in_cooldown
@@ -93,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show runtime provider health and cooldown state recorded by the proxy.",
     )
     health_parser.add_argument("app", nargs="?", choices=APP_CHOICES)
+    health_parser.add_argument("--json", action="store_true", help="Print health state as JSON.")
 
     service_parser = sub.add_parser("service", help="Install or print a systemd service for boot-time startup.")
     service_sub = service_parser.add_subparsers(dest="service_command", required=True)
@@ -132,6 +136,23 @@ def build_parser() -> argparse.ArgumentParser:
     proxy_run = proxy_sub.add_parser("run", help="Run proxy in foreground.")
     proxy_run.add_argument("--host", help="Override listen host.")
     proxy_run.add_argument("--port", type=int, help="Override listen port.")
+
+    proxy_config_parser = proxy_sub.add_parser("config", help="Show or update persistent proxy settings.")
+    proxy_config_sub = proxy_config_parser.add_subparsers(dest="proxy_config_command", required=True)
+    proxy_config_sub.add_parser("show", help="Show persistent proxy settings.")
+    proxy_config_set = proxy_config_sub.add_parser("set", help="Update persistent proxy settings.")
+    proxy_config_set.add_argument("--host", help="Persist a new listen host.")
+    proxy_config_set.add_argument("--port", type=int, help="Persist a new listen port.")
+    proxy_config_set.add_argument(
+        "--auto-failover",
+        choices=("on", "off"),
+        help="Enable or disable automatic failover.",
+    )
+    proxy_config_set.add_argument(
+        "--cooldown-sec",
+        type=int,
+        help="Cooldown applied to a failed provider before it is tried again.",
+    )
 
     proxy_sub.add_parser("down", help="Stop background proxy.")
     proxy_sub.add_parser("status", help="Show proxy status.")
@@ -294,16 +315,18 @@ def cmd_proxy_status() -> int:
     return 0
 
 
-def cmd_health(app: str | None) -> int:
+def build_health_snapshot(app: str | None = None) -> dict[str, object]:
     config = load_config()
     state = load_health_state()
     apps = [app] if app else list(APP_CHOICES)
+    result: dict[str, object] = {"apps": {}, "health_state_file": str(health_state_path())}
+
     for app_name in apps:
-        print(f"[{app_name}]")
         providers = config["apps"][app_name]["providers"]
         current = config["apps"][app_name]["current"]
+        rows: list[dict[str, object]] = []
         if not providers:
-            print("  no providers configured")
+            result["apps"][app_name] = []
             continue
         for provider_id, provider in providers.items():
             entry = ensure_provider_entry(
@@ -312,23 +335,52 @@ def cmd_health(app: str | None) -> int:
                 provider_id,
                 provider.get("name", provider_id),
             )
-            marker = "*" if provider_id == current else " "
-            status = "cooldown" if provider_in_cooldown(entry) else "ready"
+            rows.append(
+                {
+                    "provider_id": provider_id,
+                    "provider_name": provider.get("name", provider_id),
+                    "current": provider_id == current,
+                    "status": "cooldown" if provider_in_cooldown(entry) else "ready",
+                    "total_successes": entry["total_successes"],
+                    "total_failures": entry["total_failures"],
+                    "consecutive_failures": entry["consecutive_failures"],
+                    "last_success_at": format_timestamp(entry.get("last_success_at")),
+                    "last_failure_at": format_timestamp(entry.get("last_failure_at")),
+                    "cooldown_until": format_timestamp(entry.get("cooldown_until")),
+                    "last_error": entry.get("last_error"),
+                }
+            )
+        result["apps"][app_name] = rows
+    return result
+
+
+def cmd_health(app: str | None, json_mode: bool) -> int:
+    snapshot = build_health_snapshot(app)
+    if json_mode:
+        print(json.dumps(snapshot, indent=2, sort_keys=True))
+        return 0
+
+    for app_name, rows in snapshot["apps"].items():
+        print(f"[{app_name}]")
+        if not rows:
+            print("  no providers configured")
+            continue
+        for row in rows:
+            marker = "*" if row["current"] else " "
             print(
-                f"{marker} {provider_id:24} {provider.get('name', provider_id):24} "
-                f"{status:8} "
-                f"succ={entry['total_successes']} fail={entry['total_failures']} "
-                f"cfail={entry['consecutive_failures']}"
+                f"{marker} {row['provider_id']:24} {row['provider_name']:24} "
+                f"{row['status']:8} "
+                f"succ={row['total_successes']} fail={row['total_failures']} "
+                f"cfail={row['consecutive_failures']}"
             )
             print(
-                f"  last_ok={format_timestamp(entry.get('last_success_at'))} "
-                f"last_fail={format_timestamp(entry.get('last_failure_at'))} "
-                f"cooldown_until={format_timestamp(entry.get('cooldown_until'))}"
+                f"  last_ok={row['last_success_at']} "
+                f"last_fail={row['last_failure_at']} "
+                f"cooldown_until={row['cooldown_until']}"
             )
-            if entry.get("last_error"):
-                print(f"  last_error={entry['last_error']}")
-    if apps:
-        print(f"health state file: {health_state_path()}")
+            if row["last_error"]:
+                print(f"  last_error={row['last_error']}")
+    print(f"health state file: {snapshot['health_state_file']}")
     return 0
 
 
@@ -359,6 +411,41 @@ def cmd_proxy_logs() -> int:
         print("no proxy logs yet")
         return 0
     print("\n".join(lines))
+    return 0
+
+
+def cmd_proxy_config_show() -> int:
+    data = load_config()
+    print(json.dumps(proxy_config(data), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_proxy_config_set(
+    host: str | None,
+    port: int | None,
+    auto_failover: str | None,
+    cooldown_sec: int | None,
+) -> int:
+    data = load_config()
+    changed = update_proxy_config(
+        data,
+        host=host,
+        port=port,
+        auto_failover=(auto_failover == "on") if auto_failover is not None else None,
+        cooldown_sec=cooldown_sec,
+    )
+    save_config(data)
+    if not changed:
+        print("no proxy config changes")
+        return 0
+
+    print("updated proxy config:")
+    for key, value in changed.items():
+        print(f"  {key} = {value}")
+
+    runtime = proxy_runtime_status(data)
+    if runtime["running"] and any(key in changed for key in ("host", "port")):
+        print("proxy is running; host/port changes apply after restart")
     return 0
 
 
@@ -409,7 +496,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(cmd_next(args.app))
 
         if args.command == "health":
-            raise SystemExit(cmd_health(args.app))
+            raise SystemExit(cmd_health(args.app, args.json))
 
         if args.command == "service":
             if args.service_command == "install":
@@ -427,6 +514,18 @@ def main(argv: list[str] | None = None) -> None:
                 status = start_proxy_background(host=args.host, port=args.port)
                 print(f"proxy running on http://{status['host']}:{status['port']} (pid={status['pid']})")
                 raise SystemExit(0)
+            if args.proxy_command == "config":
+                if args.proxy_config_command == "show":
+                    raise SystemExit(cmd_proxy_config_show())
+                if args.proxy_config_command == "set":
+                    raise SystemExit(
+                        cmd_proxy_config_set(
+                            args.host,
+                            args.port,
+                            args.auto_failover,
+                            args.cooldown_sec,
+                        )
+                    )
             if args.proxy_command == "run":
                 raise SystemExit(cmd_proxy_run(args.host, args.port))
             if args.proxy_command == "down":

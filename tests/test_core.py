@@ -2,7 +2,8 @@ from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
-from ccproxy.config import resolve_provider_selector
+from ccproxy.cli import build_health_snapshot
+from ccproxy.config import default_config, resolve_provider_selector, update_proxy_config
 from ccproxy.health_store import (
     default_health_state,
     record_failure,
@@ -130,6 +131,21 @@ def test_record_success_clears_cooldown() -> None:
     entry = state["apps"]["codex"]["a"]
     assert entry["cooldown_until"] is None
     assert entry["consecutive_failures"] == 0
+
+
+def test_update_proxy_config_changes_cooldown_and_failover() -> None:
+    data = default_config()
+    changed = update_proxy_config(data, cooldown_sec=120, auto_failover=False)
+    assert changed == {"auto_failover": False, "cooldown_sec": 120}
+    assert data["proxy"]["cooldown_sec"] == 120
+    assert data["proxy"]["auto_failover"] is False
+
+
+def test_build_health_snapshot_has_file_and_rows() -> None:
+    snapshot = build_health_snapshot("claude")
+    assert "health_state_file" in snapshot
+    assert "apps" in snapshot
+    assert "claude" in snapshot["apps"]
 
 
 def test_build_user_unit_contains_user_manager_target() -> None:

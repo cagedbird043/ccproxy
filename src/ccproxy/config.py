@@ -91,6 +91,46 @@ def save_config(data: dict[str, Any]) -> None:
     config_path().write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def proxy_config(data: dict[str, Any]) -> dict[str, Any]:
+    return data["proxy"]
+
+
+def update_proxy_config(
+    data: dict[str, Any],
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    auto_failover: bool | None = None,
+    cooldown_sec: int | None = None,
+) -> dict[str, Any]:
+    proxy = proxy_config(data)
+    changed: dict[str, Any] = {}
+
+    if host is not None and host != proxy["host"]:
+        proxy["host"] = host
+        changed["host"] = host
+
+    if port is not None:
+        if port <= 0 or port > 65535:
+            raise ValueError(f"invalid port: {port}")
+        if port != proxy["port"]:
+            proxy["port"] = port
+            changed["port"] = port
+
+    if auto_failover is not None and auto_failover != bool(proxy.get("auto_failover", True)):
+        proxy["auto_failover"] = auto_failover
+        changed["auto_failover"] = auto_failover
+
+    if cooldown_sec is not None:
+        if cooldown_sec < 0:
+            raise ValueError(f"invalid cooldown_sec: {cooldown_sec}")
+        if cooldown_sec != int(proxy.get("cooldown_sec", 60)):
+            proxy["cooldown_sec"] = cooldown_sec
+            changed["cooldown_sec"] = cooldown_sec
+
+    return changed
+
+
 def init_config() -> Path:
     data = load_config()
     save_config(data)

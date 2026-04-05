@@ -80,6 +80,7 @@ ccproxy list claude
 ccproxy check codex
 ccproxy check claude
 ccproxy health
+ccproxy health --json
 ```
 
 ### 3. 启动本地 proxy
@@ -88,10 +89,15 @@ ccproxy health
 ccproxy proxy up
 ccproxy proxy status
 ccproxy health
+ccproxy proxy config show
+ccproxy proxy config set --cooldown-sec 120
+ccproxy proxy config set --auto-failover off
 ```
 
 默认会开启自动故障转移。当前 provider 如果在请求时连接失败，或者返回 `429/5xx`，proxy 会自动尝试下一个 provider，并把 current 更新为新的健康 provider。
 同时 proxy 会记录每个 provider 的成功/失败次数、最后错误和冷却时间。
+
+`cooldown_sec` 的意思是：某个 provider 刚失败后，先把它放冷一段时间，再允许重新尝试，避免在坏节点之间来回抖动。
 
 ### 4. 用代理模式启动 Codex / Claude
 
@@ -166,7 +172,11 @@ ccproxy proxy up
 ccproxy proxy down
 ccproxy proxy status
 ccproxy proxy logs
+ccproxy proxy config show
+ccproxy proxy config set --cooldown-sec 120
+ccproxy proxy config set --auto-failover off
 ccproxy health
+ccproxy health --json
 ccproxy health claude
 ccproxy service install --scope user --enable-now
 ccproxy service print --scope system --user "$USER"
