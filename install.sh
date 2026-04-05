@@ -70,9 +70,13 @@ install_zsh_activation() {
   body="$(cat <<EOF
 if [ -d "$ZSH_COMPLETION_DIR" ]; then
   fpath=("$ZSH_COMPLETION_DIR" \$fpath)
-  if ! whence -w compdef >/dev/null 2>&1; then
+  autoload -Uz _ccproxy 2>/dev/null || true
+  if whence -w compdef >/dev/null 2>&1; then
+    compdef _ccproxy ccproxy
+  else
     autoload -Uz compinit
     compinit
+    compdef _ccproxy ccproxy
   fi
 fi
 EOF
