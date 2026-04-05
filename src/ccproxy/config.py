@@ -23,6 +23,12 @@ def state_dir() -> Path:
     return _xdg_dir("XDG_STATE_HOME", ".local/state") / "ccproxy"
 
 
+def runtime_dir() -> Path:
+    path = state_dir() / "runtime"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def config_path() -> Path:
     return config_dir() / "config.json"
 

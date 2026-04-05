@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from ccproxy import __version__
+from ccproxy.checks import next_provider_candidates, run_check
 from ccproxy.config import (
     APP_CHOICES,
     current_provider,
@@ -73,6 +74,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     current_parser = sub.add_parser("current", help="Show current provider.")
     current_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
+
+    check_parser = sub.add_parser("check", help="Run a real non-interactive health check against a provider.")
+    check_parser.add_argument("app", choices=APP_CHOICES)
+    check_parser.add_argument("provider", nargs="?", help="Provider ID first, then exact provider name. Defaults to current provider.")
+
+    next_parser = sub.add_parser(
+        "next",
+        help="Rotate to the next healthy provider. Failed candidates are skipped automatically.",
+    )
+    next_parser.add_argument("app", choices=APP_CHOICES)
 
     use_parser = sub.add_parser("use", help="Switch current provider.")
     use_parser.add_argument("app", choices=APP_CHOICES)
@@ -191,6 +202,51 @@ def cmd_use(app: str, selector: str) -> int:
     return 0
 
 
+def cmd_check(app: str, provider: str | None) -> int:
+    result = run_check(app, provider)
+    status = "OK" if result.success else "FAIL"
+    print(
+        f"[{status}] {result.app} {result.provider_id} ({result.provider_name}) "
+        f"{result.duration_sec:.1f}s"
+    )
+    if not result.success:
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        elif result.stdout.strip():
+            print(result.stdout.strip())
+        return 1
+    return 0
+
+
+def cmd_next(app: str) -> int:
+    data = load_config()
+    candidates = next_provider_candidates(data, app)
+    if not candidates:
+        raise ValueError(f"no providers configured for {app}")
+
+    current = current_provider_id(data, app)
+    for provider_id, provider in candidates:
+        if provider_id == current and len(candidates) > 1:
+            continue
+        result = run_check(app, provider_id)
+        status = "OK" if result.success else "FAIL"
+        print(
+            f"[{status}] {app} {provider_id} ({provider.get('name', provider_id)}) "
+            f"{result.duration_sec:.1f}s"
+        )
+        if result.success:
+            _, selected = set_current_provider(data, app, provider_id)
+            save_config(data)
+            print(f"current {app}: {provider_id} ({selected.get('name', provider_id)})")
+            proxy_status = proxy_runtime_status(data)
+            if proxy_status["running"]:
+                print("proxy is running, next request will use the new provider without restarting the client")
+            return 0
+
+    print(f"no healthy provider found for {app}")
+    return 1
+
+
 def cmd_proxy_status() -> int:
     status = proxy_runtime_status(load_config())
     state = "running" if status["running"] else "stopped"
@@ -250,6 +306,12 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "current":
             print_current(args.app)
             raise SystemExit(0)
+
+        if args.command == "check":
+            raise SystemExit(cmd_check(args.app, args.provider))
+
+        if args.command == "next":
+            raise SystemExit(cmd_next(args.app))
 
         if args.command == "use":
             raise SystemExit(cmd_use(args.app, args.selector))

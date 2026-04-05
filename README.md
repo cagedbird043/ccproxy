@@ -75,6 +75,8 @@ ccproxy import-cc-switch
 ```bash
 ccproxy list codex
 ccproxy list claude
+ccproxy check codex
+ccproxy check claude
 ```
 
 ### 3. 启动本地 proxy
@@ -108,6 +110,9 @@ ccproxy use codex backup-provider
 
 ccproxy use claude ikun-1m
 ccproxy use claude fallback-claude
+
+ccproxy next codex
+ccproxy next claude
 ```
 
 当前会话不会被重启。下一次发起请求时会走新 provider。
@@ -124,6 +129,8 @@ ccproxy add claude my-claude --base-url https://example.com --api-key sk-xxx --a
 ccproxy list codex
 ccproxy current codex
 ccproxy use codex my-codex
+ccproxy check codex
+ccproxy next codex
 
 ccproxy proxy up
 ccproxy proxy down
@@ -135,6 +142,8 @@ ccproxy codex --provider my-codex -- --model gpt-5.4
 
 ccproxy claude
 ccproxy claude --provider my-claude -- --resume
+ccproxy check claude
+ccproxy next claude
 ```
 
 ## 配置

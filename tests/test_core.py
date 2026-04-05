@@ -1,3 +1,4 @@
+from ccproxy.checks import next_provider_candidates
 from ccproxy.config import resolve_provider_selector
 from ccproxy.proxy import build_upstream_url, classify_request
 
@@ -30,3 +31,21 @@ def test_classify_request_maps_codex_aliases() -> None:
 def test_classify_request_maps_claude_aliases() -> None:
     assert classify_request("/v1/messages") == ("claude", "/v1/messages")
     assert classify_request("/claude/v1/messages") == ("claude", "/v1/messages")
+
+
+def test_next_provider_candidates_rotate_after_current() -> None:
+    data = {
+        "apps": {
+            "codex": {
+                "current": "b",
+                "providers": {
+                    "a": {"name": "A"},
+                    "b": {"name": "B"},
+                    "c": {"name": "C"},
+                },
+            },
+            "claude": {"current": None, "providers": {}},
+        }
+    }
+    rotated = next_provider_candidates(data, "codex")
+    assert [provider_id for provider_id, _provider in rotated] == ["c", "a", "b"]
