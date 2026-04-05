@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ccproxy import __version__
 from ccproxy.checks import next_provider_candidates, run_check
+from ccproxy.completion import completion_provider_ids, render_completion
 from ccproxy.config import (
     APP_CHOICES,
     current_provider,
@@ -235,6 +236,15 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
     )
     claude_parser.add_argument("args", nargs=argparse.REMAINDER, help=t("Arguments forwarded to claude.", "透传给 claude 的参数。"))
 
+    completion_parser = sub.add_parser(
+        "completion",
+        help=t("Print shell completion script.", "输出 shell 自动补全脚本。"),
+    )
+    completion_parser.add_argument("shell", choices=("bash", "zsh", "fish"))
+
+    complete_providers = sub.add_parser("_complete-providers", help=argparse.SUPPRESS)
+    complete_providers.add_argument("app", choices=APP_CHOICES)
+
     internal_proxy = sub.add_parser("_proxy-run")
     internal_proxy.add_argument("--host", required=True)
     internal_proxy.add_argument("--port", required=True, type=int)
@@ -311,6 +321,17 @@ def cmd_add(args: argparse.Namespace) -> int:
     print(t(f"saved {args.app} provider: {args.id}", f"已保存 {args.app} provider: {args.id}"))
     if args.set_current:
         print(t(f"current {args.app}: {args.id}", f"当前 {args.app}: {args.id}"))
+    return 0
+
+
+def cmd_completion(shell: str) -> int:
+    print(render_completion(shell), end="")
+    return 0
+
+
+def cmd_complete_providers(app: str) -> int:
+    for provider_id in completion_provider_ids(app):
+        print(provider_id)
     return 0
 
 
@@ -641,6 +662,12 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "claude":
             raise SystemExit(launch_claude(args.provider, args.args))
+
+        if args.command == "completion":
+            raise SystemExit(cmd_completion(args.shell))
+
+        if args.command == "_complete-providers":
+            raise SystemExit(cmd_complete_providers(args.app))
 
         if args.command == "_proxy-run":
             raise SystemExit(cmd_proxy_run(args.host, args.port))

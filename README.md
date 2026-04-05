@@ -36,6 +36,11 @@ MVP 只支持：
 你不需要每次都写 `uv run`。
 
 推荐直接执行仓库自带安装脚本。它会创建一个独立虚拟环境，并把 `ccproxy` 链接到 `~/.local/bin/ccproxy`。
+同时会：
+
+- 生成 `bash` / `zsh` / `fish` 自动补全脚本
+- 给当前登录 shell 自动接入补全
+- 把 `fish` 补全放进自动加载目录
 
 ```bash
 cd ccproxy
@@ -55,6 +60,14 @@ ccproxy --help
 
 ```bash
 ./uninstall.sh
+```
+
+如果你不是用 `install.sh` 安装，也可以手动导出补全脚本：
+
+```bash
+ccproxy completion zsh
+ccproxy completion bash
+ccproxy completion fish
 ```
 
 如果你本来就喜欢 `uv` 或 `pipx`，也可以：
@@ -174,6 +187,19 @@ LANG=zh_CN.UTF-8 ccproxy health
 
 这和 Linux 常见 CLI 的思路一致，适合 SSH / tmux / Termux 这种环境。
 
+### 8. 自动补全
+
+命令面始终保持英文，但安装脚本会把自动补全接好。
+
+例如：
+
+```bash
+ccproxy pro<Tab>
+ccproxy proxy st<Tab>
+ccproxy use claude <Tab>
+ccproxy codex --provider <Tab>
+```
+
 ## 命令
 
 ```bash
@@ -196,6 +222,9 @@ ccproxy proxy logs
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
 ccproxy proxy config set --auto-failover off
+ccproxy completion zsh
+ccproxy completion bash
+ccproxy completion fish
 ccproxy health
 ccproxy health --json
 ccproxy health claude

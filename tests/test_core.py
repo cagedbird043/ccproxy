@@ -2,6 +2,7 @@ from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
+from ccproxy.completion import completion_provider_ids, render_completion
 from ccproxy.cli import build_health_snapshot, detect_cli_lang
 from ccproxy.config import default_config, proxy_runtime_status, resolve_provider_selector, update_proxy_config
 from ccproxy.health_store import (
@@ -154,6 +155,41 @@ def test_detect_cli_lang_prefers_lc_all_over_lang() -> None:
 def test_detect_cli_lang_prefers_lc_messages_over_lang() -> None:
     lang = detect_cli_lang({"LC_MESSAGES": "en_US.UTF-8", "LANG": "zh_CN.UTF-8"})
     assert lang == "en"
+
+
+def test_completion_provider_ids_reads_config(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.completion.load_config",
+        lambda: {
+            "apps": {
+                "codex": {
+                    "providers": {
+                        "b": {"name": "B"},
+                        "a": {"name": "A"},
+                    }
+                },
+                "claude": {"providers": {}},
+            }
+        },
+    )
+    assert completion_provider_ids("codex") == ["a", "b"]
+
+
+def test_render_bash_completion_mentions_complete_function() -> None:
+    script = render_completion("bash")
+    assert "complete -F _ccproxy_complete ccproxy" in script
+    assert "_complete-providers" in script
+
+
+def test_render_zsh_completion_mentions_compdef() -> None:
+    script = render_completion("zsh")
+    assert "#compdef ccproxy" in script
+    assert "_ccproxy_provider_ids_codex" in script
+
+
+def test_render_fish_completion_mentions_complete_directive() -> None:
+    script = render_completion("fish")
+    assert "complete -c ccproxy" in script
 
 
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:
