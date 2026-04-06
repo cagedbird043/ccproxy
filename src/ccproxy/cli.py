@@ -12,17 +12,22 @@ from ccproxy import __version__
 from ccproxy.checks import next_provider_candidates, run_check
 from ccproxy.completion import completion_provider_ids, render_completion
 from ccproxy.config import (
+    DEFAULT_PROVIDER_PRIORITY,
     APP_CHOICES,
     current_provider,
-    health_state_path,
     current_provider_id,
+    health_state_path,
     init_config,
     load_config,
     log_path,
     normalize_app,
+    ordered_provider_items,
+    provider_priority,
     proxy_config,
     proxy_max_body_bytes,
     proxy_runtime_status,
+    remove_provider,
+    resolve_provider_selector,
     save_config,
     set_current_provider,
     tail_file,
@@ -133,12 +138,48 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         action="store_true",
         help=t("Set this provider as current immediately.", "添加后立刻设为当前 provider。"),
     )
+    add_parser.add_argument(
+        "--priority",
+        type=int,
+        help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"),
+    )
 
     list_parser = sub.add_parser("list", help=t("List providers for an app.", "列出某个 app 的 provider。"))
     list_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
 
     current_parser = sub.add_parser("current", help=t("Show current provider.", "显示当前 provider。"))
     current_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
+
+    show_parser = sub.add_parser("show", help=t("Show a provider config.", "显示单个 provider 配置。"))
+    show_parser.add_argument("app", choices=APP_CHOICES)
+    show_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
+
+    update_parser = sub.add_parser("update", help=t("Update a provider config.", "更新 provider 配置。"))
+    update_parser.add_argument("app", choices=APP_CHOICES)
+    update_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
+    update_parser.add_argument("--name", help=t("Human-readable provider name.", "便于识别的 provider 名称。"))
+    update_parser.add_argument("--base-url", help=t("Upstream base URL.", "上游 base URL。"))
+    update_parser.add_argument("--api-key", help=t("Upstream API key.", "上游 API key。"))
+    update_parser.add_argument("--model", help=t("Default model for Codex launcher.", "Codex 启动时默认模型。"))
+    update_parser.add_argument(
+        "--auth-mode",
+        choices=("bearer", "x-api-key", "both"),
+        help=t("Auth mode for Claude upstreams.", "Claude 上游的鉴权模式。"),
+    )
+    update_parser.add_argument(
+        "--priority",
+        type=int,
+        help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"),
+    )
+    update_parser.add_argument(
+        "--set-current",
+        action="store_true",
+        help=t("Set this provider as current immediately.", "更新后立刻设为当前 provider。"),
+    )
+
+    delete_parser = sub.add_parser("delete", help=t("Delete a provider.", "删除 provider。"))
+    delete_parser.add_argument("app", choices=APP_CHOICES)
+    delete_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
 
     check_parser = sub.add_parser("check", help=t("Run a real non-interactive health check against a provider.", "对 provider 跑一次真实的非交互健康检查。"))
     check_parser.add_argument("app", choices=APP_CHOICES)
@@ -213,6 +254,16 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         help=t("Cooldown applied to a failed provider before it is tried again.", "失败 provider 在再次尝试前的冷却秒数。"),
     )
     proxy_config_set.add_argument(
+        "--failure-threshold",
+        type=int,
+        help=t("How many failed requests before a provider enters cooldown.", "连续多少次请求失败后才进入冷却。"),
+    )
+    proxy_config_set.add_argument(
+        "--retry-attempts",
+        type=int,
+        help=t("How many attempts to make on the same provider before failover.", "同一个 provider 在故障转移前最多重试多少次。"),
+    )
+    proxy_config_set.add_argument(
         "--max-body-mb",
         type=int,
         help=t("Maximum accepted request body size in MiB.", "允许的最大请求体大小，单位 MiB。"),
@@ -261,29 +312,49 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
 def print_provider_list(app: str) -> None:
     data = load_config()
     app = normalize_app(app)
-    providers = data["apps"][app]["providers"]
     current = data["apps"][app]["current"]
-    if not providers:
+    ordered = ordered_provider_items(data, app)
+    if not ordered:
         print(t(f"[{app}] no providers configured", f"[{app}] 没有配置 provider"))
         return
 
     print(t(f"[{app}] providers", f"[{app}] provider 列表"))
-    for provider_id, provider in providers.items():
+    for provider_id, provider in ordered:
         marker = "*" if provider_id == current else " "
         name = provider.get("name", provider_id)
         base_url = provider.get("base_url", "")
-        print(f"{marker} {provider_id:24} {name:24} {base_url}")
+        priority = provider_priority(provider)
+        print(f"{marker} p={priority:<4} {provider_id:24} {name:24} {base_url}")
 
 
 def print_current(app: str) -> None:
     data = load_config()
     provider_id, provider = current_provider(data, app)
+    priority = provider_priority(provider)
     print(
         t(
-            f"{app}: {provider_id} ({provider.get('name', provider_id)}) -> {provider.get('base_url')}",
-            f"{app}: {provider_id} ({provider.get('name', provider_id)}) -> {provider.get('base_url')}",
+            f"{app}: {provider_id} ({provider.get('name', provider_id)}) p={priority} -> {provider.get('base_url')}",
+            f"{app}: {provider_id} ({provider.get('name', provider_id)}) p={priority} -> {provider.get('base_url')}",
         )
     )
+
+
+def cmd_show(app: str, selector: str) -> int:
+    data = load_config()
+    provider_id, provider = resolve_provider_selector(data["apps"][app]["providers"], selector)
+    print(
+        json.dumps(
+            {
+                "app": app,
+                "provider_id": provider_id,
+                "current": provider_id == current_provider_id(data, app),
+                "provider": provider,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def cmd_import_cc_switch(db_path: Path) -> int:
@@ -315,6 +386,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         "api_key": args.api_key,
         "model": args.model,
         "auth_mode": args.auth_mode or "bearer",
+        "priority": args.priority if args.priority is not None else DEFAULT_PROVIDER_PRIORITY,
     }
     upsert_provider(
         data,
@@ -327,6 +399,66 @@ def cmd_add(args: argparse.Namespace) -> int:
     print(t(f"saved {args.app} provider: {args.id}", f"已保存 {args.app} provider: {args.id}"))
     if args.set_current:
         print(t(f"current {args.app}: {args.id}", f"当前 {args.app}: {args.id}"))
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    data = load_config()
+    provider_id, provider = resolve_provider_selector(data["apps"][args.app]["providers"], args.selector)
+    changed: dict[str, object] = {}
+
+    for key, value in (
+        ("name", args.name),
+        ("base_url", args.base_url),
+        ("api_key", args.api_key),
+        ("model", args.model),
+        ("auth_mode", args.auth_mode),
+        ("priority", args.priority),
+    ):
+        if value is None:
+            continue
+        if provider.get(key) != value:
+            provider[key] = value
+            changed[key] = value
+
+    if args.set_current and current_provider_id(data, args.app) != provider_id:
+        set_current_provider(data, args.app, provider_id)
+        changed["current"] = provider_id
+
+    if not changed:
+        print(t("no provider changes", "provider 配置没有变化"))
+        return 0
+
+    save_config(data)
+    print(t(f"updated {args.app} provider: {provider_id}", f"已更新 {args.app} provider: {provider_id}"))
+    for key, value in changed.items():
+        print(f"  {key} = {value}")
+    return 0
+
+
+def cmd_delete(app: str, selector: str) -> int:
+    data = load_config()
+    previous_current = current_provider_id(data, app)
+    provider_id, provider = remove_provider(data, app, selector)
+    new_current = current_provider_id(data, app)
+    save_config(data)
+    print(
+        t(
+            f"deleted {app} provider: {provider_id} ({provider.get('name', provider_id)})",
+            f"已删除 {app} provider: {provider_id} ({provider.get('name', provider_id)})",
+        )
+    )
+    if previous_current != new_current:
+        if new_current is None:
+            print(t(f"current {app}: none", f"当前 {app}: 无"))
+        else:
+            current_id, current = current_provider(data, app)
+            print(
+                t(
+                    f"current {app}: {current_id} ({current.get('name', current_id)})",
+                    f"当前 {app}: {current_id} ({current.get('name', current_id)})",
+                )
+            )
     return 0
 
 
@@ -419,6 +551,18 @@ def cmd_proxy_status() -> int:
         )
     )
     print(t(f"cooldown sec: {status['cooldown_sec']}", f"冷却秒数: {status['cooldown_sec']}"))
+    print(
+        t(
+            f"failure threshold: {status['failure_threshold']}",
+            f"失败阈值: {status['failure_threshold']}",
+        )
+    )
+    print(
+        t(
+            f"retry attempts: {status['retry_attempts']}",
+            f"同 provider 重试次数: {status['retry_attempts']}",
+        )
+    )
     print(t(f"max body mb: {status['max_body_mb']}", f"请求体上限 MiB: {status['max_body_mb']}"))
     if status["pid"]:
         print(f"pid: {status['pid']}")
@@ -437,13 +581,13 @@ def build_health_snapshot(app: str | None = None) -> dict[str, object]:
     result: dict[str, object] = {"apps": {}, "health_state_file": str(health_state_path())}
 
     for app_name in apps:
-        providers = config["apps"][app_name]["providers"]
         current = config["apps"][app_name]["current"]
         rows: list[dict[str, object]] = []
-        if not providers:
+        ordered = ordered_provider_items(config, app_name)
+        if not ordered:
             result["apps"][app_name] = []
             continue
-        for provider_id, provider in providers.items():
+        for provider_id, provider in ordered:
             entry = ensure_provider_entry(
                 state,
                 app_name,
@@ -454,6 +598,7 @@ def build_health_snapshot(app: str | None = None) -> dict[str, object]:
                 {
                     "provider_id": provider_id,
                     "provider_name": provider.get("name", provider_id),
+                    "priority": provider_priority(provider),
                     "current": provider_id == current,
                     "status": "cooldown" if provider_in_cooldown(entry) else "ready",
                     "total_successes": entry["total_successes"],
@@ -483,7 +628,7 @@ def cmd_health(app: str | None, json_mode: bool) -> int:
         for row in rows:
             marker = "*" if row["current"] else " "
             print(
-                f"{marker} {row['provider_id']:24} {row['provider_name']:24} "
+                f"{marker} p={row['priority']:<4} {row['provider_id']:24} {row['provider_name']:24} "
                 f"{row['status']:8} "
                 f"succ={row['total_successes']} fail={row['total_failures']} "
                 f"cfail={row['consecutive_failures']}"
@@ -540,6 +685,8 @@ def cmd_proxy_config_set(
     port: int | None,
     auto_failover: str | None,
     cooldown_sec: int | None,
+    failure_threshold: int | None,
+    retry_attempts: int | None,
     max_body_mb: int | None,
 ) -> int:
     data = load_config()
@@ -549,6 +696,8 @@ def cmd_proxy_config_set(
         port=port,
         auto_failover=(auto_failover == "on") if auto_failover is not None else None,
         cooldown_sec=cooldown_sec,
+        failure_threshold=failure_threshold,
+        retry_attempts=retry_attempts,
         max_body_mb=max_body_mb,
     )
     save_config(data)
@@ -618,6 +767,15 @@ def main(argv: list[str] | None = None) -> None:
             print_current(args.app)
             raise SystemExit(0)
 
+        if args.command == "show":
+            raise SystemExit(cmd_show(args.app, args.selector))
+
+        if args.command == "update":
+            raise SystemExit(cmd_update(args))
+
+        if args.command == "delete":
+            raise SystemExit(cmd_delete(args.app, args.selector))
+
         if args.command == "check":
             raise SystemExit(cmd_check(args.app, args.provider))
 
@@ -659,6 +817,8 @@ def main(argv: list[str] | None = None) -> None:
                             args.port,
                             args.auto_failover,
                             args.cooldown_sec,
+                            args.failure_threshold,
+                            args.retry_attempts,
                             args.max_body_mb,
                         )
                     )

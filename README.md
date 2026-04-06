@@ -28,7 +28,7 @@
 
 - `Codex`
 - `Claude`
-- provider 导入、列出、切换
+- provider 导入、增删改查、列出、切换
 - proxy 内自动故障转移
 - 失败冷却和运行期健康状态
 - 本地 proxy 前台/后台运行
@@ -108,14 +108,21 @@ ccproxy proxy status
 ccproxy health
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
+ccproxy proxy config set --failure-threshold 3
+ccproxy proxy config set --retry-attempts 3
 ccproxy proxy config set --max-body-mb 128
 ccproxy proxy config set --auto-failover off
 ```
 
-默认会开启自动故障转移。当前 provider 如果在请求时连接失败，或者返回 `429/5xx`，proxy 会自动尝试下一个 provider，并把 current 更新为新的健康 provider。
+默认会开启自动故障转移。当前 provider 如果在请求时连接失败，或者返回 `429/5xx`，proxy 会先在同一个 provider 上重试，再按优先级尝试下一个 provider。
+`current` 不会被自动改写；它始终保留为你手动选择的主 provider。自动故障转移只影响这一次请求和运行期健康状态。
 同时 proxy 会记录每个 provider 的成功/失败次数、最后错误和冷却时间。
 
 `cooldown_sec` 的意思是：某个 provider 刚失败后，先把它放冷一段时间，再允许重新尝试，避免在坏节点之间来回抖动。
+
+`failure_threshold` 的意思是：同一个 provider 连续失败多少次之后，才真正进入 cooldown。
+
+`retry_attempts` 的意思是：同一次请求里，同一个 provider 最多重试多少次后才触发 failover。
 
 `max_body_mb` 是本地代理允许接收的最大请求体大小，默认是 `64` MiB。这个值主要用来避免 `aiohttp` 默认 `1` MiB 上限把大上下文请求提前拦死。
 
@@ -143,6 +150,9 @@ ccproxy claude --provider ikun-1m
 ```bash
 ccproxy use codex yescodex
 ccproxy use codex backup-provider
+ccproxy show codex yescodex
+ccproxy update codex yescodex --priority 10
+ccproxy delete codex old-provider
 
 ccproxy use claude ikun-1m
 ccproxy use claude fallback-claude
@@ -214,11 +224,14 @@ ccproxy codex --provider <Tab>
 ccproxy init
 ccproxy import-cc-switch
 
-ccproxy add codex my-codex --base-url https://example.com/v1 --api-key sk-xxx --model gpt-5.4
+ccproxy add codex my-codex --base-url https://example.com/v1 --api-key sk-xxx --model gpt-5.4 --priority 10
 ccproxy add claude my-claude --base-url https://example.com --api-key sk-xxx --auth-mode bearer
 
 ccproxy list codex
 ccproxy current codex
+ccproxy show codex my-codex
+ccproxy update codex my-codex --priority 10
+ccproxy delete codex old-codex
 ccproxy use codex my-codex
 ccproxy check codex
 ccproxy next codex
@@ -229,6 +242,8 @@ ccproxy proxy status
 ccproxy proxy logs
 ccproxy proxy config show
 ccproxy proxy config set --cooldown-sec 120
+ccproxy proxy config set --failure-threshold 3
+ccproxy proxy config set --retry-attempts 3
 ccproxy proxy config set --max-body-mb 128
 ccproxy proxy config set --auto-failover off
 ccproxy completion zsh
@@ -258,6 +273,8 @@ ccproxy next claude
 - `~/.local/state/ccproxy/proxy.log`
 
 当前 provider 状态也保存在 `config.json` 中，proxy 每次请求都会重新读取，因此切换是热的。
+
+每个 provider 还可以带一个整数 `priority`。数字越小，自动故障转移时优先级越高；但 `current` 仍然永远优先于其他 provider。
 
 ## 设计边界
 

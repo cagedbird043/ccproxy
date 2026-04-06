@@ -88,6 +88,7 @@ def record_failure(
     provider_name: str,
     error: str,
     cooldown_sec: int,
+    failure_threshold: int,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
     now_ts = now_ts or time.time()
@@ -96,7 +97,10 @@ def record_failure(
     entry["consecutive_failures"] += 1
     entry["last_failure_at"] = now_ts
     entry["last_error"] = error
-    entry["cooldown_until"] = now_ts + max(cooldown_sec, 0)
+    if entry["consecutive_failures"] >= max(failure_threshold, 1):
+        entry["cooldown_until"] = now_ts + max(cooldown_sec, 0)
+    else:
+        entry["cooldown_until"] = None
     return entry
 
 

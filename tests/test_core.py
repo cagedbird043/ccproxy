@@ -6,8 +6,10 @@ from ccproxy.completion import completion_provider_ids, render_completion
 from ccproxy.cli import build_health_snapshot, detect_cli_lang
 from ccproxy.config import (
     default_config,
+    ordered_provider_items,
     proxy_max_body_bytes,
     proxy_runtime_status,
+    remove_provider,
     resolve_provider_selector,
     update_proxy_config,
 )
@@ -69,9 +71,9 @@ def test_next_provider_candidates_rotate_after_current() -> None:
             "codex": {
                 "current": "b",
                 "providers": {
-                    "a": {"name": "A"},
-                    "b": {"name": "B"},
-                    "c": {"name": "C"},
+                    "a": {"name": "A", "priority": 20},
+                    "b": {"name": "B", "priority": 30},
+                    "c": {"name": "C", "priority": 10},
                 },
             },
             "claude": {"current": None, "providers": {}},
@@ -88,15 +90,33 @@ def test_provider_attempt_order_keeps_current_first() -> None:
             "codex": {
                 "current": "b",
                 "providers": {
-                    "a": {"name": "A"},
-                    "b": {"name": "B"},
-                    "c": {"name": "C"},
+                    "a": {"name": "A", "priority": 10},
+                    "b": {"name": "B", "priority": 30},
+                    "c": {"name": "C", "priority": 20},
                 },
             },
             "claude": {"current": None, "providers": {}},
         }
     }
     ordered = provider_attempt_order(data, default_health_state(), "codex")
+    assert [provider_id for provider_id, _provider in ordered] == ["b", "a", "c"]
+
+
+def test_ordered_provider_items_uses_priority_after_current() -> None:
+    data = {
+        "apps": {
+            "codex": {
+                "current": "b",
+                "providers": {
+                    "a": {"name": "A", "priority": 30},
+                    "b": {"name": "B", "priority": 999},
+                    "c": {"name": "C", "priority": 10},
+                },
+            },
+            "claude": {"current": None, "providers": {}},
+        }
+    }
+    ordered = ordered_provider_items(data, "codex")
     assert [provider_id for provider_id, _provider in ordered] == ["b", "c", "a"]
 
 
@@ -116,6 +136,7 @@ def test_reorder_providers_moves_cooling_provider_to_end() -> None:
         "A",
         "boom",
         cooldown_sec=60,
+        failure_threshold=1,
         now_ts=100.0,
     )
     items = [("a", {"name": "A"}), ("b", {"name": "B"})]
@@ -132,6 +153,7 @@ def test_record_success_clears_cooldown() -> None:
         "A",
         "boom",
         cooldown_sec=60,
+        failure_threshold=1,
         now_ts=100.0,
     )
     record_success(state, "codex", "a", "A", now_ts=120.0)
@@ -140,12 +162,64 @@ def test_record_success_clears_cooldown() -> None:
     assert entry["consecutive_failures"] == 0
 
 
+def test_record_failure_waits_for_threshold_before_cooldown() -> None:
+    state = default_health_state()
+    record_failure(
+        state,
+        "codex",
+        "a",
+        "A",
+        "boom1",
+        cooldown_sec=60,
+        failure_threshold=3,
+        now_ts=100.0,
+    )
+    record_failure(
+        state,
+        "codex",
+        "a",
+        "A",
+        "boom2",
+        cooldown_sec=60,
+        failure_threshold=3,
+        now_ts=110.0,
+    )
+    assert state["apps"]["codex"]["a"]["cooldown_until"] is None
+
+    record_failure(
+        state,
+        "codex",
+        "a",
+        "A",
+        "boom3",
+        cooldown_sec=60,
+        failure_threshold=3,
+        now_ts=120.0,
+    )
+    assert state["apps"]["codex"]["a"]["cooldown_until"] == 180.0
+
+
 def test_update_proxy_config_changes_cooldown_and_failover() -> None:
     data = default_config()
-    changed = update_proxy_config(data, cooldown_sec=120, auto_failover=False, max_body_mb=96)
-    assert changed == {"auto_failover": False, "cooldown_sec": 120, "max_body_mb": 96}
+    changed = update_proxy_config(
+        data,
+        cooldown_sec=120,
+        auto_failover=False,
+        failure_threshold=4,
+        retry_attempts=5,
+        max_body_mb=96,
+    )
+    assert changed == {
+        "auto_failover": False,
+        "cooldown_sec": 120,
+        "failure_threshold": 4,
+        "retry_attempts": 5,
+        "max_body_mb": 96,
+    }
     assert data["proxy"]["cooldown_sec"] == 120
     assert data["proxy"]["auto_failover"] is False
+    assert data["proxy"]["failure_threshold"] == 4
+    assert data["proxy"]["retry_attempts"] == 5
     assert data["proxy"]["max_body_mb"] == 96
 
 
@@ -197,17 +271,22 @@ def test_render_bash_completion_mentions_complete_function() -> None:
     script = render_completion("bash")
     assert "complete -F _ccproxy_complete ccproxy" in script
     assert "_complete-providers" in script
+    assert "show" in script
+    assert "--failure-threshold" in script
 
 
 def test_render_zsh_completion_mentions_compdef() -> None:
     script = render_completion("zsh")
     assert "#compdef ccproxy" in script
     assert "_ccproxy_provider_ids_codex" in script
+    assert "update provider config" in script
+    assert "--retry-attempts" in script
 
 
 def test_render_fish_completion_mentions_complete_directive() -> None:
     script = render_completion("fish")
     assert "complete -c ccproxy" in script
+    assert "show update delete" in script
 
 
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:
@@ -222,6 +301,8 @@ def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None
     assert status["running"] is True
     assert status["healthy"] is True
     assert status["manager"] == "systemd-system"
+    assert status["failure_threshold"] == 3
+    assert status["retry_attempts"] == 3
 
 
 def test_build_health_snapshot_has_file_and_rows() -> None:
@@ -229,6 +310,26 @@ def test_build_health_snapshot_has_file_and_rows() -> None:
     assert "health_state_file" in snapshot
     assert "apps" in snapshot
     assert "claude" in snapshot["apps"]
+
+
+def test_remove_provider_promotes_best_remaining() -> None:
+    data = {
+        "apps": {
+            "codex": {
+                "current": "b",
+                "providers": {
+                    "a": {"name": "A", "priority": 10},
+                    "b": {"name": "B", "priority": 30},
+                    "c": {"name": "C", "priority": 20},
+                },
+            },
+            "claude": {"current": None, "providers": {}},
+        }
+    }
+    removed_id, _removed = remove_provider(data, "codex", "b")
+    assert removed_id == "b"
+    assert data["apps"]["codex"]["current"] == "a"
+    assert "b" not in data["apps"]["codex"]["providers"]
 
 
 def test_build_user_unit_contains_user_manager_target() -> None:

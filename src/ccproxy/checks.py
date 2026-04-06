@@ -14,6 +14,7 @@ from ccproxy.config import (
     current_provider_id,
     load_config,
     normalize_app,
+    ordered_provider_items,
     providers_for,
     resolve_provider_selector,
     runtime_dir,
@@ -210,17 +211,16 @@ def run_check(app: str, selector: str | None = None) -> CheckResult:
 
 def next_provider_candidates(data: dict[str, Any], app: str) -> list[tuple[str, dict[str, Any]]]:
     app = normalize_app(app)
-    providers = providers_for(data, app)
-    if not providers:
+    ordered = ordered_provider_items(data, app)
+    if not ordered:
         return []
 
-    items = list(providers.items())
     current_id = current_provider_id(data, app)
     if current_id is None:
-        return items
+        return ordered
 
-    index = next((idx for idx, (provider_id, _provider) in enumerate(items) if provider_id == current_id), None)
-    if index is None:
-        return items
-
-    return items[index + 1 :] + items[: index + 1]
+    return [
+        item for item in ordered if item[0] != current_id
+    ] + [
+        item for item in ordered if item[0] == current_id
+    ]

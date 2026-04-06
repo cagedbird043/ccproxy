@@ -10,6 +10,9 @@ COMMANDS = [
     "add",
     "list",
     "current",
+    "show",
+    "update",
+    "delete",
     "check",
     "next",
     "health",
@@ -94,7 +97,10 @@ def render_bash_completion() -> str:
                 opts="--db-path"
                 ;;
               add)
-                opts="--name --base-url --api-key --model --auth-mode --set-current"
+                opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
+                ;;
+              update)
+                opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
                 ;;
               health)
                 opts="--json"
@@ -120,7 +126,7 @@ def render_bash_completion() -> str:
                   config)
                     case "$subsubcmd" in
                       set)
-                        opts="--host --port --auto-failover --cooldown-sec --max-body-mb"
+                        opts="--host --port --auto-failover --cooldown-sec --failure-threshold --retry-attempts --max-body-mb"
                         ;;
                     esac
                     ;;
@@ -143,13 +149,13 @@ def render_bash_completion() -> str:
           fi
 
           case "$cmd" in
-            add|list|current|check|next|health|use)
+            add|list|current|show|update|delete|check|next|health|use)
               if (( COMP_CWORD == 2 )); then
                 COMPREPLY=( $(compgen -W "{apps}" -- "$cur") )
                 return 0
               fi
               ;;
-            check|use)
+            show|update|delete|check|use)
               if (( COMP_CWORD == 3 )); then
                 COMPREPLY=( $(compgen -W "$(_ccproxy_provider_ids "$subcmd")" -- "$cur") )
                 return 0
@@ -216,6 +222,9 @@ def render_zsh_completion() -> str:
             'add:add a provider'
             'list:list providers'
             'current:show current provider'
+            'show:show provider config'
+            'update:update provider config'
+            'delete:delete a provider'
             'check:run provider health check'
             'next:rotate to next healthy provider'
             'health:show runtime health'
@@ -248,15 +257,13 @@ def render_zsh_completion() -> str:
                 '--api-key[upstream api key]:api key:' \
                 '--model[default model for codex]:model:' \
                 '--auth-mode[auth mode]:(bearer x-api-key both)' \
+                '--priority[lower number means higher failover priority]:priority:' \
                 '--set-current[set as current immediately]'
               ;;
             list|current|next)
               _arguments '2:app:(codex claude)'
               ;;
-            health)
-              _arguments '--json[print health as json]' '2:app:(codex claude)'
-              ;;
-            check|use)
+            show|delete|check|use)
               if (( CURRENT == 3 )); then
                 _values 'app' codex claude
                 return
@@ -265,6 +272,27 @@ def render_zsh_completion() -> str:
                 _ccproxy_provider_ids "$words[3]"
                 return
               fi
+              ;;
+            update)
+              if (( CURRENT == 3 )); then
+                _values 'app' codex claude
+                return
+              fi
+              if (( CURRENT == 4 )); then
+                _ccproxy_provider_ids "$words[3]"
+                return
+              fi
+              _arguments \
+                '--name[provider display name]:name:' \
+                '--base-url[upstream base url]:url:' \
+                '--api-key[upstream api key]:api key:' \
+                '--model[default model for codex]:model:' \
+                '--auth-mode[auth mode]:(bearer x-api-key both)' \
+                '--priority[lower number means higher failover priority]:priority:' \
+                '--set-current[set as current immediately]'
+              ;;
+            health)
+              _arguments '--json[print health as json]' '2:app:(codex claude)'
               ;;
             service)
               if (( CURRENT == 3 )); then
@@ -322,6 +350,8 @@ def render_zsh_completion() -> str:
                         '--port[listen port]:port:' \
                         '--auto-failover[enable or disable auto failover]:(on off)' \
                         '--cooldown-sec[cooldown seconds]:seconds:' \
+                        '--failure-threshold[failures before cooldown]:count:' \
+                        '--retry-attempts[same-provider retries before failover]:count:' \
                         '--max-body-mb[maximum accepted request body size in MiB]:mebibytes:'
                       ;;
                   esac
@@ -353,9 +383,9 @@ def render_fish_completion() -> str:
             ccproxy _complete-providers $app 2>/dev/null
         end
 
-        complete -c ccproxy -f -n '__fish_use_subcommand' -a 'init import-cc-switch add list current check next health service use proxy codex claude completion'
+        complete -c ccproxy -f -n '__fish_use_subcommand' -a 'init import-cc-switch add list current show update delete check next health service use proxy codex claude completion'
 
-        complete -c ccproxy -n '__fish_seen_subcommand_from add list current check next health use' -f -a 'codex claude'
+        complete -c ccproxy -n '__fish_seen_subcommand_from add list current show update delete check next health use' -f -a 'codex claude'
 
         complete -c ccproxy -n '__fish_seen_subcommand_from service; and not __fish_seen_subcommand_from install print uninstall' -f -a 'install print uninstall'
         complete -c ccproxy -n '__fish_seen_subcommand_from service install print uninstall' -l scope -a 'user system'
@@ -371,6 +401,8 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l port
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l auto-failover -a 'on off'
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l cooldown-sec
+        complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l failure-threshold
+        complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l retry-attempts
         complete -c ccproxy -n '__fish_seen_subcommand_from proxy config set' -l max-body-mb
 
         complete -c ccproxy -n '__fish_seen_subcommand_from import-cc-switch' -l db-path
@@ -379,7 +411,15 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l api-key
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l model
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l auth-mode -a 'bearer x-api-key both'
+        complete -c ccproxy -n '__fish_seen_subcommand_from add' -l priority
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l set-current
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l name
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l base-url
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l api-key
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l model
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l auth-mode -a 'bearer x-api-key both'
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l priority
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l set-current
         complete -c ccproxy -n '__fish_seen_subcommand_from health' -l json
 
         complete -c ccproxy -n '__fish_seen_subcommand_from codex' -l provider -a '(__fish_ccproxy_provider_ids codex)'
@@ -387,6 +427,8 @@ def render_fish_completion() -> str:
 
         complete -c ccproxy -n '__fish_seen_subcommand_from use; and test (count (commandline -opc)) -ge 3; and test (commandline -opc)[3] = codex' -f -a '(__fish_ccproxy_provider_ids codex)'
         complete -c ccproxy -n '__fish_seen_subcommand_from use; and test (count (commandline -opc)) -ge 3; and test (commandline -opc)[3] = claude' -f -a '(__fish_ccproxy_provider_ids claude)'
+        complete -c ccproxy -n '__fish_seen_subcommand_from show update delete; and test (count (commandline -opc)) -ge 3; and test (commandline -opc)[3] = codex' -f -a '(__fish_ccproxy_provider_ids codex)'
+        complete -c ccproxy -n '__fish_seen_subcommand_from show update delete; and test (count (commandline -opc)) -ge 3; and test (commandline -opc)[3] = claude' -f -a '(__fish_ccproxy_provider_ids claude)'
         complete -c ccproxy -n '__fish_seen_subcommand_from check; and test (count (commandline -opc)) -ge 3; and test (commandline -opc)[3] = codex' -f -a '(__fish_ccproxy_provider_ids codex)'
         complete -c ccproxy -n '__fish_seen_subcommand_from check; and test (count (commandline -opc)) -ge 3; and test (commandline -opc)[3] = claude' -f -a '(__fish_ccproxy_provider_ids claude)'
 

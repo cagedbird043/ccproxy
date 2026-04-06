@@ -9,7 +9,7 @@ from typing import Any
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from ccproxy.adapters import ADAPTERS_BY_APP, build_upstream_url, route_request
-from ccproxy.config import current_provider_id, load_config, proxy_max_body_bytes, save_config
+from ccproxy.config import load_config, ordered_provider_items, proxy_max_body_bytes
 from ccproxy.health_store import (
     load_health_state,
     record_failure,
@@ -42,34 +42,11 @@ def provider_attempt_order(
     health_state: dict[str, Any],
     app: str,
 ) -> list[tuple[str, dict[str, Any]]]:
-    providers = config["apps"][app]["providers"]
-    if not providers:
+    if not config["apps"][app]["providers"]:
         raise ValueError(f"no providers configured for {app}")
 
-    items = list(providers.items())
-    current_id = current_provider_id(config, app)
-    if not current_id:
-        return items
-
-    index = next(
-        (idx for idx, (provider_id, _provider) in enumerate(items) if provider_id == current_id),
-        None,
-    )
-    if index is None:
-        return reorder_providers_by_cooldown(items, health_state, app)
-    ordered = items[index:] + items[:index]
+    ordered = ordered_provider_items(config, app)
     return reorder_providers_by_cooldown(ordered, health_state, app)
-
-
-def persist_failover_selection(
-    config: dict[str, Any],
-    app: str,
-    provider_id: str,
-) -> None:
-    if config["apps"][app]["current"] == provider_id:
-        return
-    config["apps"][app]["current"] = provider_id
-    save_config(config)
 
 
 async def _update_health_state(
@@ -107,6 +84,8 @@ async def forward(request: web.Request) -> web.StreamResponse:
     session: ClientSession = request.app["session"]
     auto_failover = bool(config["proxy"].get("auto_failover", True))
     cooldown_sec = int(config["proxy"].get("cooldown_sec", 60))
+    failure_threshold = int(config["proxy"].get("failure_threshold", 3))
+    retry_attempts = int(config["proxy"].get("retry_attempts", 3))
     attempts = provider_attempt_order(config, health_state, app)
     last_error: str | None = None
 
@@ -115,107 +94,141 @@ async def forward(request: web.Request) -> web.StreamResponse:
             provider["base_url"], upstream_path, request.query_string
         )
         headers = adapter.build_headers(request.headers, provider)
-        logging.info("proxy %s -> %s (%s)", request.path_qs, upstream_url, provider_id)
-
-        try:
-            async with session.request(
-                request.method,
+        for retry_index in range(retry_attempts):
+            logging.info(
+                "proxy %s -> %s (%s) attempt=%s/%s",
+                request.path_qs,
                 upstream_url,
-                headers=headers,
-                data=body,
-            ) as upstream:
-                can_failover = (
-                    auto_failover
-                    and attempt_index + 1 < len(attempts)
-                    and should_failover_status(upstream.status)
-                )
-                if can_failover:
-                    last_error = f"upstream status {upstream.status}"
-                    await _update_health_state(
-                        request,
-                        lambda state: record_failure(
-                            state,
-                            app,
+                provider_id,
+                retry_index + 1,
+                retry_attempts,
+            )
+
+            try:
+                async with session.request(
+                    request.method,
+                    upstream_url,
+                    headers=headers,
+                    data=body,
+                ) as upstream:
+                    should_retry_same_provider = (
+                        should_failover_status(upstream.status)
+                        and retry_index + 1 < retry_attempts
+                    )
+                    if should_retry_same_provider:
+                        logging.warning(
+                            "provider %s returned %s for %s, retrying same provider (%s/%s)",
                             provider_id,
-                            provider.get("name", provider_id),
-                            last_error or "",
-                            cooldown_sec,
-                            now_ts=time.time(),
-                        ),
+                            upstream.status,
+                            request.path_qs,
+                            retry_index + 1,
+                            retry_attempts,
+                        )
+                        await upstream.read()
+                        continue
+
+                    provider_failed = should_failover_status(upstream.status)
+                    if provider_failed:
+                        last_error = f"upstream status {upstream.status}"
+                        await _update_health_state(
+                            request,
+                            lambda state: record_failure(
+                                state,
+                                app,
+                                provider_id,
+                                provider.get("name", provider_id),
+                                last_error or "",
+                                cooldown_sec,
+                                failure_threshold,
+                                now_ts=time.time(),
+                            ),
+                        )
+                        can_failover = auto_failover and attempt_index + 1 < len(attempts)
+                        if can_failover:
+                            logging.warning(
+                                "provider %s returned %s for %s after %s attempts, trying next provider",
+                                provider_id,
+                                upstream.status,
+                                request.path_qs,
+                                retry_attempts,
+                            )
+                            await upstream.read()
+                            break
+
+                    if 200 <= upstream.status < 300:
+                        await _update_health_state(
+                            request,
+                            lambda state: record_success(
+                                state,
+                                app,
+                                provider_id,
+                                provider.get("name", provider_id),
+                                now_ts=time.time(),
+                            ),
+                        )
+
+                    response_headers = {
+                        key: value
+                        for key, value in upstream.headers.items()
+                        if key.lower() not in HOP_BY_HOP_HEADERS
+                    }
+                    response = web.StreamResponse(
+                        status=upstream.status,
+                        headers=response_headers,
                     )
+                    await response.prepare(request)
+                    async for chunk in upstream.content.iter_chunked(64 * 1024):
+                        await response.write(chunk)
+                    await response.write_eof()
+                    return response
+            except (ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = str(exc)
+                if retry_index + 1 < retry_attempts:
                     logging.warning(
-                        "provider %s returned %s for %s, trying next provider",
+                        "provider %s request failed for %s: %s; retrying same provider (%s/%s)",
                         provider_id,
-                        upstream.status,
                         request.path_qs,
+                        exc,
+                        retry_index + 1,
+                        retry_attempts,
                     )
-                    await upstream.read()
                     continue
 
-                if attempt_index > 0:
-                    persist_failover_selection(config, app, provider_id)
-                    logging.warning(
-                        "auto failover switched %s current provider to %s",
+                await _update_health_state(
+                    request,
+                    lambda state: record_failure(
+                        state,
                         app,
                         provider_id,
+                        provider.get("name", provider_id),
+                        last_error or "",
+                        cooldown_sec,
+                        failure_threshold,
+                        now_ts=time.time(),
+                    ),
+                )
+                can_failover = auto_failover and attempt_index + 1 < len(attempts)
+                if can_failover:
+                    logging.warning(
+                        "provider %s request failed for %s after %s attempts: %s; trying next provider",
+                        provider_id,
+                        request.path_qs,
+                        retry_attempts,
+                        exc,
                     )
-                if 200 <= upstream.status < 300:
-                    await _update_health_state(
-                        request,
-                        lambda state: record_success(
-                            state,
-                            app,
-                            provider_id,
-                            provider.get("name", provider_id),
-                            now_ts=time.time(),
-                        ),
-                    )
+                    break
+                return web.json_response(
+                    {
+                        "error": "upstream request failed",
+                        "provider_id": provider_id,
+                        "detail": str(exc),
+                    },
+                    status=502,
+                )
+        else:
+            continue
 
-                response_headers = {
-                    key: value
-                    for key, value in upstream.headers.items()
-                    if key.lower() not in HOP_BY_HOP_HEADERS
-                }
-                response = web.StreamResponse(
-                    status=upstream.status,
-                    headers=response_headers,
-                )
-                await response.prepare(request)
-                async for chunk in upstream.content.iter_chunked(64 * 1024):
-                    await response.write(chunk)
-                await response.write_eof()
-                return response
-        except (ClientError, asyncio.TimeoutError, OSError) as exc:
-            last_error = str(exc)
-            await _update_health_state(
-                request,
-                lambda state: record_failure(
-                    state,
-                    app,
-                    provider_id,
-                    provider.get("name", provider_id),
-                    last_error or "",
-                    cooldown_sec,
-                    now_ts=time.time(),
-                ),
-            )
-            can_failover = auto_failover and attempt_index + 1 < len(attempts)
-            if can_failover:
-                logging.warning(
-                    "provider %s request failed for %s: %s; trying next provider",
-                    provider_id,
-                    request.path_qs,
-                    exc,
-                )
-                continue
-            return web.json_response(
-                {
-                    "error": "upstream request failed",
-                    "provider_id": provider_id,
-                    "detail": str(exc),
-                },
-                status=502,
-            )
+        continue
 
     return web.json_response(
         {

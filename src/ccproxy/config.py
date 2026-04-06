@@ -10,6 +10,7 @@ from typing import Any
 from ccproxy.service import systemd_service_scope
 
 APP_CHOICES = ("codex", "claude")
+DEFAULT_PROVIDER_PRIORITY = 1000
 
 
 def _xdg_dir(env_key: str, default_suffix: str) -> Path:
@@ -62,6 +63,8 @@ def default_config() -> dict[str, Any]:
             "port": 15721,
             "auto_failover": True,
             "cooldown_sec": 60,
+            "failure_threshold": 3,
+            "retry_attempts": 3,
             "max_body_mb": 64,
         },
         "apps": {
@@ -107,6 +110,8 @@ def update_proxy_config(
     port: int | None = None,
     auto_failover: bool | None = None,
     cooldown_sec: int | None = None,
+    failure_threshold: int | None = None,
+    retry_attempts: int | None = None,
     max_body_mb: int | None = None,
 ) -> dict[str, Any]:
     proxy = proxy_config(data)
@@ -133,6 +138,20 @@ def update_proxy_config(
         if cooldown_sec != int(proxy.get("cooldown_sec", 60)):
             proxy["cooldown_sec"] = cooldown_sec
             changed["cooldown_sec"] = cooldown_sec
+
+    if failure_threshold is not None:
+        if failure_threshold <= 0:
+            raise ValueError(f"invalid failure_threshold: {failure_threshold}")
+        if failure_threshold != int(proxy.get("failure_threshold", 3)):
+            proxy["failure_threshold"] = failure_threshold
+            changed["failure_threshold"] = failure_threshold
+
+    if retry_attempts is not None:
+        if retry_attempts <= 0:
+            raise ValueError(f"invalid retry_attempts: {retry_attempts}")
+        if retry_attempts != int(proxy.get("retry_attempts", 3)):
+            proxy["retry_attempts"] = retry_attempts
+            changed["retry_attempts"] = retry_attempts
 
     if max_body_mb is not None:
         if max_body_mb <= 0:
@@ -170,6 +189,16 @@ def providers_for(data: dict[str, Any], app: str) -> dict[str, dict[str, Any]]:
     return data["apps"][app]["providers"]
 
 
+def provider_priority(provider: dict[str, Any]) -> int:
+    raw = provider.get("priority")
+    if raw is None:
+        return DEFAULT_PROVIDER_PRIORITY
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid provider priority: {raw}") from exc
+
+
 def resolve_provider_selector(
     providers: dict[str, dict[str, Any]], selector: str
 ) -> tuple[str, dict[str, Any]]:
@@ -204,6 +233,19 @@ def current_provider(data: dict[str, Any], app: str) -> tuple[str, dict[str, Any
     return current_id, providers[current_id]
 
 
+def ordered_provider_items(data: dict[str, Any], app: str) -> list[tuple[str, dict[str, Any]]]:
+    app = normalize_app(app)
+    current_id = current_provider_id(data, app)
+    items = list(providers_for(data, app).items())
+    return sorted(
+        items,
+        key=lambda item: (
+            0 if current_id is not None and item[0] == current_id else 1,
+            provider_priority(item[1]),
+        ),
+    )
+
+
 def set_current_provider(data: dict[str, Any], app: str, selector: str) -> tuple[str, dict[str, Any]]:
     app = normalize_app(app)
     provider_id, provider = resolve_provider_selector(providers_for(data, app), selector)
@@ -223,6 +265,22 @@ def upsert_provider(
     providers_for(data, app)[provider_id] = provider
     if set_current or not data["apps"][app]["current"]:
         data["apps"][app]["current"] = provider_id
+
+
+def remove_provider(
+    data: dict[str, Any],
+    app: str,
+    selector: str,
+) -> tuple[str, dict[str, Any]]:
+    app = normalize_app(app)
+    providers = providers_for(data, app)
+    provider_id, provider = resolve_provider_selector(providers, selector)
+    del providers[provider_id]
+
+    if data["apps"][app]["current"] == provider_id:
+        ordered = ordered_provider_items(data, app)
+        data["apps"][app]["current"] = ordered[0][0] if ordered else None
+    return provider_id, provider
 
 
 def pid_from_file() -> int | None:
@@ -287,6 +345,8 @@ def proxy_runtime_status(data: dict[str, Any]) -> dict[str, Any]:
         "port": port,
         "auto_failover": bool(data["proxy"].get("auto_failover", True)),
         "cooldown_sec": int(data["proxy"].get("cooldown_sec", 60)),
+        "failure_threshold": int(data["proxy"].get("failure_threshold", 3)),
+        "retry_attempts": int(data["proxy"].get("retry_attempts", 3)),
         "max_body_mb": int(data["proxy"].get("max_body_mb", 64)),
         "log_path": str(log_path()),
         "health_path": str(health_state_path()),
