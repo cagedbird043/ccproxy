@@ -14,6 +14,7 @@ COMMANDS = [
     "update",
     "delete",
     "check",
+    "test",
     "next",
     "health",
     "service",
@@ -21,7 +22,6 @@ COMMANDS = [
     "proxy",
     "codex",
     "claude",
-    "completion",
 ]
 
 
@@ -102,7 +102,7 @@ def render_bash_completion() -> str:
               update)
                 opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
                 ;;
-              health)
+              test|health)
                 opts="--json"
                 ;;
               service)
@@ -149,7 +149,7 @@ def render_bash_completion() -> str:
           fi
 
           case "$cmd" in
-            add|list|current|show|update|delete|check|next|health|use)
+            add|list|current|show|update|delete|check|test|next|health|use)
               if (( COMP_CWORD == 2 )); then
                 COMPREPLY=( $(compgen -W "{apps}" -- "$cur") )
                 return 0
@@ -226,6 +226,7 @@ def render_zsh_completion() -> str:
             'update:update provider config'
             'delete:delete a provider'
             'check:run provider health check'
+            'test:batch test providers'
             'next:rotate to next healthy provider'
             'health:show runtime health'
             'service:manage systemd service'
@@ -233,7 +234,6 @@ def render_zsh_completion() -> str:
             'proxy:manage local proxy'
             'codex:launch codex through proxy'
             'claude:launch claude through proxy'
-            'completion:print shell completion'
           )
 
           if (( CURRENT == 2 )); then
@@ -263,6 +263,9 @@ def render_zsh_completion() -> str:
             list|current|next)
               _arguments '2:app:(codex claude)'
               ;;
+            test|health)
+              _arguments '--json[print result as json]' '2:app:(codex claude)'
+              ;;
             show|delete|check|use)
               if (( CURRENT == 3 )); then
                 _values 'app' codex claude
@@ -290,9 +293,6 @@ def render_zsh_completion() -> str:
                 '--auth-mode[auth mode]:(bearer x-api-key both)' \
                 '--priority[lower number means higher failover priority]:priority:' \
                 '--set-current[set as current immediately]'
-              ;;
-            health)
-              _arguments '--json[print health as json]' '2:app:(codex claude)'
               ;;
             service)
               if (( CURRENT == 3 )); then
@@ -383,9 +383,9 @@ def render_fish_completion() -> str:
             ccproxy _complete-providers $app 2>/dev/null
         end
 
-        complete -c ccproxy -f -n '__fish_use_subcommand' -a 'init import-cc-switch add list current show update delete check next health service use proxy codex claude completion'
+        complete -c ccproxy -f -n '__fish_use_subcommand' -a 'init import-cc-switch add list current show update delete check test next health service use proxy codex claude'
 
-        complete -c ccproxy -n '__fish_seen_subcommand_from add list current show update delete check next health use' -f -a 'codex claude'
+        complete -c ccproxy -n '__fish_seen_subcommand_from add list current show update delete check test next health use' -f -a 'codex claude'
 
         complete -c ccproxy -n '__fish_seen_subcommand_from service; and not __fish_seen_subcommand_from install print uninstall' -f -a 'install print uninstall'
         complete -c ccproxy -n '__fish_seen_subcommand_from service install print uninstall' -l scope -a 'user system'
@@ -420,7 +420,7 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l auth-mode -a 'bearer x-api-key both'
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l priority
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l set-current
-        complete -c ccproxy -n '__fish_seen_subcommand_from health' -l json
+        complete -c ccproxy -n '__fish_seen_subcommand_from health test' -l json
 
         complete -c ccproxy -n '__fish_seen_subcommand_from codex' -l provider -a '(__fish_ccproxy_provider_ids codex)'
         complete -c ccproxy -n '__fish_seen_subcommand_from claude' -l provider -a '(__fish_ccproxy_provider_ids claude)'

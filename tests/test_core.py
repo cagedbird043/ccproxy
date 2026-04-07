@@ -3,7 +3,8 @@ from pathlib import Path
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
 from ccproxy.completion import completion_provider_ids, render_completion
-from ccproxy.cli import build_health_snapshot, detect_cli_lang
+from ccproxy.checks import CheckResult
+from ccproxy.cli import build_health_snapshot, build_parser, build_test_snapshot, detect_cli_lang
 from ccproxy.config import (
     default_config,
     ordered_provider_items,
@@ -273,6 +274,7 @@ def test_render_bash_completion_mentions_complete_function() -> None:
     assert "_complete-providers" in script
     assert "show" in script
     assert "--failure-threshold" in script
+    assert "test" in script
 
 
 def test_render_zsh_completion_mentions_compdef() -> None:
@@ -281,12 +283,24 @@ def test_render_zsh_completion_mentions_compdef() -> None:
     assert "_ccproxy_provider_ids_codex" in script
     assert "update provider config" in script
     assert "--retry-attempts" in script
+    assert "batch test providers" in script
+    assert "completion:print shell completion" not in script
 
 
 def test_render_fish_completion_mentions_complete_directive() -> None:
     script = render_completion("fish")
     assert "complete -c ccproxy" in script
     assert "show update delete" in script
+    assert "check test next" in script
+    assert "claude completion" not in script
+
+
+def test_build_parser_hides_internal_completion_commands_from_help() -> None:
+    help_text = build_parser("en").format_help()
+    assert "test                Batch test providers" in help_text
+    assert "completion          ==SUPPRESS==" not in help_text
+    assert "_complete-providers" not in help_text
+    assert "_proxy-run" not in help_text
 
 
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:
@@ -310,6 +324,49 @@ def test_build_health_snapshot_has_file_and_rows() -> None:
     assert "health_state_file" in snapshot
     assert "apps" in snapshot
     assert "claude" in snapshot["apps"]
+
+
+def test_build_test_snapshot_collects_results(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.cli.load_config",
+        lambda: {
+            "apps": {
+                "codex": {
+                    "current": "b",
+                    "providers": {
+                        "a": {"name": "A", "priority": 20},
+                        "b": {"name": "B", "priority": 10},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            }
+        },
+    )
+
+    def fake_run_check(app: str, selector: str | None = None) -> CheckResult:
+        provider_id = selector or "missing"
+        return CheckResult(
+            app=app,
+            provider_id=provider_id,
+            provider_name=provider_id.upper(),
+            success=(provider_id == "b"),
+            duration_sec=1.25,
+            summary="healthy" if provider_id == "b" else "failed",
+            stdout="" if provider_id == "b" else "boom stdout",
+            stderr="",
+            returncode=0 if provider_id == "b" else 1,
+        )
+
+    monkeypatch.setattr("ccproxy.cli.run_check", fake_run_check)
+
+    snapshot = build_test_snapshot("codex")
+    assert snapshot["summary"] == {"ok": 1, "fail": 1, "total": 2}
+    rows = snapshot["apps"]["codex"]
+    assert rows[0]["provider_id"] == "b"
+    assert rows[0]["current"] is True
+    assert rows[0]["success"] is True
+    assert rows[1]["provider_id"] == "a"
+    assert rows[1]["detail"] == "boom stdout"
 
 
 def test_remove_provider_promotes_best_remaining() -> None:

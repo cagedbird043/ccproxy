@@ -96,6 +96,8 @@ ccproxy list codex
 ccproxy list claude
 ccproxy check codex
 ccproxy check claude
+ccproxy test codex
+ccproxy test
 ccproxy health
 ccproxy health --json
 ```
@@ -156,6 +158,10 @@ ccproxy delete codex old-provider
 
 ccproxy use claude ikun-1m
 ccproxy use claude fallback-claude
+
+ccproxy test codex
+ccproxy test claude
+ccproxy test --json
 
 ccproxy next codex
 ccproxy next claude
@@ -234,6 +240,8 @@ ccproxy update codex my-codex --priority 10
 ccproxy delete codex old-codex
 ccproxy use codex my-codex
 ccproxy check codex
+ccproxy test codex
+ccproxy test
 ccproxy next codex
 
 ccproxy proxy up
@@ -261,6 +269,7 @@ ccproxy codex --provider my-codex -- --model gpt-5.4
 ccproxy claude
 ccproxy claude --provider my-claude -- --resume
 ccproxy check claude
+ccproxy test claude
 ccproxy next claude
 ```
 

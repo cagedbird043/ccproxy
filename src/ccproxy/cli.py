@@ -47,6 +47,25 @@ from ccproxy.service import build_unit, current_username, install_service, resol
 
 
 CLI_LANG = "en"
+PUBLIC_COMMANDS = (
+    "init",
+    "import-cc-switch",
+    "add",
+    "list",
+    "current",
+    "show",
+    "update",
+    "delete",
+    "check",
+    "test",
+    "next",
+    "health",
+    "service",
+    "use",
+    "proxy",
+    "codex",
+    "claude",
+)
 
 LANG_ALIASES = {
     "zh": "zh",
@@ -96,6 +115,12 @@ def detect_cli_lang(env: dict[str, str] | None = None) -> str:
     return "en"
 
 
+def _hide_subparser(subparsers, name: str) -> None:
+    subparsers._choices_actions = [
+        action for action in subparsers._choices_actions if getattr(action, "dest", None) != name
+    ]
+
+
 def build_parser(lang: str = "en") -> argparse.ArgumentParser:
     global CLI_LANG
     CLI_LANG = lang
@@ -107,7 +132,11 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{" + ",".join(PUBLIC_COMMANDS) + "}",
+    )
 
     sub.add_parser("init", help=t("Create config skeleton if missing.", "初始化配置骨架。"))
 
@@ -184,6 +213,13 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
     check_parser = sub.add_parser("check", help=t("Run a real non-interactive health check against a provider.", "对 provider 跑一次真实的非交互健康检查。"))
     check_parser.add_argument("app", choices=APP_CHOICES)
     check_parser.add_argument("provider", nargs="?", help=t("Provider ID first, then exact provider name. Defaults to current provider.", "优先传 provider ID，其次精确名称；默认检查当前 provider。"))
+
+    test_parser = sub.add_parser(
+        "test",
+        help=t("Batch test providers and print a readable summary.", "批量测试 provider，并输出人类可读汇总。"),
+    )
+    test_parser.add_argument("app", nargs="?", choices=APP_CHOICES)
+    test_parser.add_argument("--json", action="store_true", help=t("Print test result as JSON.", "以 JSON 输出测试结果。"))
 
     next_parser = sub.add_parser(
         "next",
@@ -295,7 +331,7 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
 
     completion_parser = sub.add_parser(
         "completion",
-        help=t("Print shell completion script.", "输出 shell 自动补全脚本。"),
+        help=argparse.SUPPRESS,
     )
     completion_parser.add_argument("shell", choices=("bash", "zsh", "fish"))
 
@@ -305,6 +341,9 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
     internal_proxy = sub.add_parser("_proxy-run")
     internal_proxy.add_argument("--host", required=True)
     internal_proxy.add_argument("--port", required=True, type=int)
+
+    for hidden_command in ("completion", "_complete-providers", "_proxy-run"):
+        _hide_subparser(sub, hidden_command)
 
     return parser
 
@@ -503,6 +542,88 @@ def cmd_check(app: str, provider: str | None) -> int:
             print(result.stdout.strip())
         return 1
     return 0
+
+
+def _check_detail(result) -> str | None:
+    for text in (result.stderr, result.stdout):
+        stripped = text.strip()
+        if stripped:
+            first_line = stripped.splitlines()[0].strip()
+            if first_line:
+                return first_line
+    return None
+
+
+def build_test_snapshot(app: str | None = None) -> dict[str, object]:
+    data = load_config()
+    apps = [normalize_app(app)] if app else list(APP_CHOICES)
+    snapshot: dict[str, object] = {"apps": {}, "summary": {"ok": 0, "fail": 0, "total": 0}}
+    summary = snapshot["summary"]
+
+    for app_name in apps:
+        ordered = ordered_provider_items(data, app_name)
+        rows: list[dict[str, object]] = []
+        if not ordered:
+            snapshot["apps"][app_name] = rows
+            continue
+
+        current = current_provider_id(data, app_name)
+        for provider_id, provider in ordered:
+            result = run_check(app_name, provider_id)
+            rows.append(
+                {
+                    "provider_id": provider_id,
+                    "provider_name": provider.get("name", provider_id),
+                    "priority": provider_priority(provider),
+                    "current": provider_id == current,
+                    "success": result.success,
+                    "duration_sec": result.duration_sec,
+                    "summary": result.summary,
+                    "detail": _check_detail(result),
+                    "returncode": result.returncode,
+                }
+            )
+            summary["total"] += 1
+            if result.success:
+                summary["ok"] += 1
+            else:
+                summary["fail"] += 1
+
+        snapshot["apps"][app_name] = rows
+
+    return snapshot
+
+
+def cmd_test(app: str | None, json_mode: bool) -> int:
+    snapshot = build_test_snapshot(app)
+    if json_mode:
+        print(json.dumps(snapshot, indent=2, sort_keys=True))
+        return 0 if snapshot["summary"]["fail"] == 0 else 1
+
+    for app_name, rows in snapshot["apps"].items():
+        print(f"[{app_name}]")
+        if not rows:
+            print(t("  no providers configured", "  没有配置 provider"))
+            continue
+        for row in rows:
+            marker = "*" if row["current"] else " "
+            status = t("OK", "成功") if row["success"] else t("FAIL", "失败")
+            print(
+                f"{marker} [{status}] p={row['priority']:<4} "
+                f"{row['provider_id']:24} {row['provider_name']:24} "
+                f"{row['duration_sec']:.1f}s"
+            )
+            if row["detail"]:
+                print(f"  {row['detail']}")
+
+    summary = snapshot["summary"]
+    print(
+        t(
+            f"summary: ok={summary['ok']} fail={summary['fail']} total={summary['total']}",
+            f"汇总: 成功={summary['ok']} 失败={summary['fail']} 总计={summary['total']}",
+        )
+    )
+    return 0 if summary["fail"] == 0 else 1
 
 
 def cmd_next(app: str) -> int:
@@ -778,6 +899,9 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "check":
             raise SystemExit(cmd_check(args.app, args.provider))
+
+        if args.command == "test":
+            raise SystemExit(cmd_test(args.app, args.json))
 
         if args.command == "next":
             raise SystemExit(cmd_next(args.app))
