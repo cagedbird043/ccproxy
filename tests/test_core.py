@@ -4,7 +4,7 @@ from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
 from ccproxy.completion import completion_provider_ids, render_completion
 from ccproxy.checks import CheckResult
-from ccproxy.cli import build_health_snapshot, build_parser, build_test_snapshot, detect_cli_lang
+from ccproxy.cli import _check_detail, build_health_snapshot, build_parser, build_test_snapshot, detect_cli_lang
 from ccproxy.config import (
     default_config,
     ordered_provider_items,
@@ -352,7 +352,18 @@ def test_build_test_snapshot_collects_results(monkeypatch) -> None:
             success=(provider_id == "b"),
             duration_sec=1.25,
             summary="healthy" if provider_id == "b" else "failed",
-            stdout="" if provider_id == "b" else "boom stdout",
+            stdout=(
+                "Reading additional input from stdin...\nCCPROXY_CHECK_OK\n"
+                if provider_id == "b"
+                else "\n".join(
+                    [
+                        "Reading additional input from stdin...",
+                        "OpenAI Codex v0.118.0 (research preview)",
+                        "ERROR: Reconnecting... 1/5",
+                        "ERROR: unexpected status 403 Forbidden: balance low",
+                    ]
+                )
+            ),
             stderr="",
             returncode=0 if provider_id == "b" else 1,
         )
@@ -365,8 +376,24 @@ def test_build_test_snapshot_collects_results(monkeypatch) -> None:
     assert rows[0]["provider_id"] == "b"
     assert rows[0]["current"] is True
     assert rows[0]["success"] is True
+    assert rows[0]["detail"] is None
     assert rows[1]["provider_id"] == "a"
-    assert rows[1]["detail"] == "boom stdout"
+    assert rows[1]["detail"] == "ERROR: unexpected status 403 Forbidden: balance low"
+
+
+def test_check_detail_prefers_result_field_from_json_error() -> None:
+    result = CheckResult(
+        app="claude",
+        provider_id="x",
+        provider_name="Claude X",
+        success=False,
+        duration_sec=1.0,
+        summary="failed",
+        stdout='{"result":"Failed to authenticate. API Error: 403 {\\"error\\":{\\"message\\":\\"quota low\\"}}"}\n',
+        stderr="",
+        returncode=1,
+    )
+    assert _check_detail(result) == 'Failed to authenticate. API Error: 403 {"error":{"message":"quota low"}}'
 
 
 def test_remove_provider_promotes_best_remaining() -> None:

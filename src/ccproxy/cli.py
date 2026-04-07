@@ -47,6 +47,21 @@ from ccproxy.service import build_unit, current_username, install_service, resol
 
 
 CLI_LANG = "en"
+CHECK_MARKER = "CCPROXY_CHECK_OK"
+CHECK_DETAIL_NOISE_PREFIXES = (
+    "Reading additional input from stdin...",
+    "OpenAI Codex ",
+    "workdir:",
+    "model:",
+    "provider:",
+    "approval:",
+    "sandbox:",
+    "reasoning effort:",
+    "reasoning summaries:",
+    "session id:",
+)
+CHECK_DETAIL_NOISE_LINES = {"--------", "user", CHECK_MARKER}
+
 PUBLIC_COMMANDS = (
     "init",
     "import-cc-switch",
@@ -545,12 +560,38 @@ def cmd_check(app: str, provider: str | None) -> int:
 
 
 def _check_detail(result) -> str | None:
+    error_lines: list[str] = []
+    info_lines: list[str] = []
+
     for text in (result.stderr, result.stdout):
-        stripped = text.strip()
-        if stripped:
-            first_line = stripped.splitlines()[0].strip()
-            if first_line:
-                return first_line
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped in CHECK_DETAIL_NOISE_LINES:
+                continue
+            if stripped.startswith(CHECK_DETAIL_NOISE_PREFIXES):
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                parsed = payload.get("result")
+                if isinstance(parsed, str):
+                    stripped = parsed.strip()
+                else:
+                    stripped = ""
+                if not stripped or stripped in CHECK_DETAIL_NOISE_LINES:
+                    continue
+            if stripped.startswith("ERROR:"):
+                error_lines.append(stripped)
+                continue
+            info_lines.append(stripped)
+    if error_lines:
+        return error_lines[-1]
+    if result.success:
+        return None
+    if info_lines:
+        return info_lines[0]
     return None
 
 
