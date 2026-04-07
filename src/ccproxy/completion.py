@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-from ccproxy.config import APP_CHOICES, load_config
+from ccproxy.config import APP_CHOICES, current_provider_id, load_config, ordered_provider_items
 
 COMMANDS = [
     "init",
@@ -25,10 +25,21 @@ COMMANDS = [
 ]
 
 
-def completion_provider_ids(app: str) -> list[str]:
+def completion_provider_entries(app: str) -> list[tuple[str, str]]:
     data = load_config()
-    providers = data["apps"][app]["providers"]
-    return sorted(providers.keys())
+    current = current_provider_id(data, app)
+    entries: list[tuple[str, str]] = []
+    for provider_id, provider in ordered_provider_items(data, app):
+        name = provider.get("name", provider_id)
+        description = name
+        if provider_id == current:
+            description = f"{description} [current]"
+        entries.append((provider_id, description))
+    return entries
+
+
+def completion_provider_ids(app: str) -> list[str]:
+    return [provider_id for provider_id, _description in completion_provider_entries(app)]
 
 
 def render_completion(shell: str) -> str:
@@ -49,7 +60,7 @@ def render_bash_completion() -> str:
         # bash completion for ccproxy
         _ccproxy_provider_ids() {{
           local app="$1"
-          ccproxy _complete-providers "$app" 2>/dev/null
+          ccproxy _complete-providers "$app" 2>/dev/null | cut -f1
         }}
 
         _ccproxy_complete() {{
@@ -198,8 +209,18 @@ def render_zsh_completion() -> str:
 
         _ccproxy_provider_ids() {
           local app="$1"
+          local line value desc
           local -a providers
-          providers=(${(f)"$(ccproxy _complete-providers "$app" 2>/dev/null)"})
+          while IFS=$'\t' read -r value desc; do
+            [[ -z "$value" ]] && continue
+            if [[ -n "$desc" ]]; then
+              desc="${desc//\\/\\\\}"
+              desc="${desc//:/\\:}"
+              providers+=("${value}:${desc}")
+            else
+              providers+=("${value}")
+            fi
+          done < <(ccproxy _complete-providers "$app" 2>/dev/null)
           _describe -t providers 'provider' providers
         }
 

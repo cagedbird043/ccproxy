@@ -10,7 +10,7 @@ from pathlib import Path
 
 from ccproxy import __version__
 from ccproxy.checks import next_provider_candidates, run_check
-from ccproxy.completion import completion_provider_ids, render_completion
+from ccproxy.completion import completion_provider_entries, render_completion
 from ccproxy.config import (
     DEFAULT_PROVIDER_PRIORITY,
     APP_CHOICES,
@@ -385,10 +385,11 @@ def print_current(app: str) -> None:
     data = load_config()
     provider_id, provider = current_provider(data, app)
     priority = provider_priority(provider)
+    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
     print(
         t(
-            f"{app}: {provider_id} ({provider.get('name', provider_id)}) p={priority} -> {provider.get('base_url')}",
-            f"{app}: {provider_id} ({provider.get('name', provider_id)}) p={priority} -> {provider.get('base_url')}",
+            f"{app}: {provider_label} p={priority} -> {provider.get('base_url')}",
+            f"{app}: {provider_label} p={priority} -> {provider.get('base_url')}",
         )
     )
 
@@ -450,9 +451,10 @@ def cmd_add(args: argparse.Namespace) -> int:
         set_current=args.set_current,
     )
     save_config(data)
-    print(t(f"saved {args.app} provider: {args.id}", f"已保存 {args.app} provider: {args.id}"))
+    provider_label = format_provider_label(args.id, provider.get("name", args.id))
+    print(t(f"saved {args.app} provider: {provider_label}", f"已保存 {args.app} provider: {provider_label}"))
     if args.set_current:
-        print(t(f"current {args.app}: {args.id}", f"当前 {args.app}: {args.id}"))
+        print(t(f"current {args.app}: {provider_label}", f"当前 {args.app}: {provider_label}"))
     return 0
 
 
@@ -484,7 +486,8 @@ def cmd_update(args: argparse.Namespace) -> int:
         return 0
 
     save_config(data)
-    print(t(f"updated {args.app} provider: {provider_id}", f"已更新 {args.app} provider: {provider_id}"))
+    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
+    print(t(f"updated {args.app} provider: {provider_label}", f"已更新 {args.app} provider: {provider_label}"))
     for key, value in changed.items():
         print(f"  {key} = {value}")
     return 0
@@ -496,10 +499,11 @@ def cmd_delete(app: str, selector: str) -> int:
     provider_id, provider = remove_provider(data, app, selector)
     new_current = current_provider_id(data, app)
     save_config(data)
+    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
     print(
         t(
-            f"deleted {app} provider: {provider_id} ({provider.get('name', provider_id)})",
-            f"已删除 {app} provider: {provider_id} ({provider.get('name', provider_id)})",
+            f"deleted {app} provider: {provider_label}",
+            f"已删除 {app} provider: {provider_label}",
         )
     )
     if previous_current != new_current:
@@ -507,10 +511,11 @@ def cmd_delete(app: str, selector: str) -> int:
             print(t(f"current {app}: none", f"当前 {app}: 无"))
         else:
             current_id, current = current_provider(data, app)
+            current_label = format_provider_label(current_id, current.get("name", current_id))
             print(
                 t(
-                    f"current {app}: {current_id} ({current.get('name', current_id)})",
-                    f"当前 {app}: {current_id} ({current.get('name', current_id)})",
+                    f"current {app}: {current_label}",
+                    f"当前 {app}: {current_label}",
                 )
             )
     return 0
@@ -522,8 +527,8 @@ def cmd_completion(shell: str) -> int:
 
 
 def cmd_complete_providers(app: str) -> int:
-    for provider_id in completion_provider_ids(app):
-        print(provider_id)
+    for provider_id, description in completion_provider_entries(app):
+        print(f"{provider_id}\t{description}")
     return 0
 
 
@@ -532,7 +537,8 @@ def cmd_use(app: str, selector: str) -> int:
     provider_id, provider = set_current_provider(data, app, selector)
     save_config(data)
     status = proxy_runtime_status(data)
-    print(t(f"current {app}: {provider_id} ({provider.get('name', provider_id)})", f"当前 {app}: {provider_id} ({provider.get('name', provider_id)})"))
+    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
+    print(t(f"current {app}: {provider_label}", f"当前 {app}: {provider_label}"))
     if status["running"]:
         print(
             t(
@@ -546,8 +552,9 @@ def cmd_use(app: str, selector: str) -> int:
 def cmd_check(app: str, provider: str | None) -> int:
     result = run_check(app, provider)
     status = t("OK", "成功") if result.success else t("FAIL", "失败")
+    provider_label = format_provider_label(result.provider_id, result.provider_name)
     print(
-        f"[{status}] {result.app} {result.provider_id} ({result.provider_name}) "
+        f"[{status}] {result.app} {provider_label} "
         f"{result.duration_sec:.1f}s"
     )
     if not result.success:
@@ -593,6 +600,13 @@ def _check_detail(result) -> str | None:
     if info_lines:
         return info_lines[0]
     return None
+
+
+def format_provider_label(provider_id: str, provider_name: str | None) -> str:
+    name = (provider_name or provider_id).strip() or provider_id
+    if name == provider_id:
+        return provider_id
+    return f"{name} ({provider_id})"
 
 
 def build_test_snapshot(app: str | None = None) -> dict[str, object]:
@@ -679,14 +693,16 @@ def cmd_next(app: str) -> int:
             continue
         result = run_check(app, provider_id)
         status = t("OK", "成功") if result.success else t("FAIL", "失败")
+        provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
         print(
-            f"[{status}] {app} {provider_id} ({provider.get('name', provider_id)}) "
+            f"[{status}] {app} {provider_label} "
             f"{result.duration_sec:.1f}s"
         )
         if result.success:
             _, selected = set_current_provider(data, app, provider_id)
             save_config(data)
-            print(t(f"current {app}: {provider_id} ({selected.get('name', provider_id)})", f"当前 {app}: {provider_id} ({selected.get('name', provider_id)})"))
+            selected_label = format_provider_label(provider_id, selected.get("name", provider_id))
+            print(t(f"current {app}: {selected_label}", f"当前 {app}: {selected_label}"))
             proxy_status = proxy_runtime_status(data)
             if proxy_status["running"]:
                 print(

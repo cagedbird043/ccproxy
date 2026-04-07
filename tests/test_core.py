@@ -2,9 +2,16 @@ from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import next_provider_candidates
-from ccproxy.completion import completion_provider_ids, render_completion
+from ccproxy.completion import completion_provider_entries, completion_provider_ids, render_completion
 from ccproxy.checks import CheckResult
-from ccproxy.cli import _check_detail, build_health_snapshot, build_parser, build_test_snapshot, detect_cli_lang
+from ccproxy.cli import (
+    _check_detail,
+    build_health_snapshot,
+    build_parser,
+    build_test_snapshot,
+    detect_cli_lang,
+    format_provider_label,
+)
 from ccproxy.config import (
     default_config,
     ordered_provider_items,
@@ -256,6 +263,7 @@ def test_completion_provider_ids_reads_config(monkeypatch) -> None:
         lambda: {
             "apps": {
                 "codex": {
+                    "current": "b",
                     "providers": {
                         "b": {"name": "B"},
                         "a": {"name": "A"},
@@ -265,13 +273,36 @@ def test_completion_provider_ids_reads_config(monkeypatch) -> None:
             }
         },
     )
-    assert completion_provider_ids("codex") == ["a", "b"]
+    assert completion_provider_ids("codex") == ["b", "a"]
+
+
+def test_completion_provider_entries_include_human_readable_descriptions(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.completion.load_config",
+        lambda: {
+            "apps": {
+                "codex": {
+                    "current": "b",
+                    "providers": {
+                        "b": {"name": "YesCodex", "priority": 20},
+                        "a": {"name": "CodeZ", "priority": 30},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            }
+        },
+    )
+    assert completion_provider_entries("codex") == [
+        ("b", "YesCodex [current]"),
+        ("a", "CodeZ"),
+    ]
 
 
 def test_render_bash_completion_mentions_complete_function() -> None:
     script = render_completion("bash")
     assert "complete -F _ccproxy_complete ccproxy" in script
     assert "_complete-providers" in script
+    assert "cut -f1" in script
     assert "show" in script
     assert "--failure-threshold" in script
     assert "test" in script
@@ -281,6 +312,8 @@ def test_render_zsh_completion_mentions_compdef() -> None:
     script = render_completion("zsh")
     assert "#compdef ccproxy" in script
     assert "_ccproxy_provider_ids_codex" in script
+    assert "read -r value desc" in script
+    assert "_complete-providers" in script
     assert "update provider config" in script
     assert "--retry-attempts" in script
     assert "batch test providers" in script
@@ -290,6 +323,7 @@ def test_render_zsh_completion_mentions_compdef() -> None:
 def test_render_fish_completion_mentions_complete_directive() -> None:
     script = render_completion("fish")
     assert "complete -c ccproxy" in script
+    assert "_complete-providers $app" in script
     assert "show update delete" in script
     assert "check test next" in script
     assert "claude completion" not in script
@@ -394,6 +428,11 @@ def test_check_detail_prefers_result_field_from_json_error() -> None:
         returncode=1,
     )
     assert _check_detail(result) == 'Failed to authenticate. API Error: 403 {"error":{"message":"quota low"}}'
+
+
+def test_format_provider_label_prefers_human_name() -> None:
+    assert format_provider_label("9d03", "YesCodex") == "YesCodex (9d03)"
+    assert format_provider_label("default", "default") == "default"
 
 
 def test_remove_provider_promotes_best_remaining() -> None:
