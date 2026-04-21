@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
@@ -41,6 +42,7 @@ from ccproxy.proxy import (
     should_failover_status,
     summarize_upstream_error,
 )
+from ccproxy.read_models import build_current_provider_summary
 from ccproxy.service import build_unit
 from ccproxy.tui import CCProxyTUI
 
@@ -501,6 +503,81 @@ def test_tui_background_test_complete_queues_popup_and_clears_busy(monkeypatch) 
     assert tui.background_job is None
     assert tui.pending_popup is not None
     assert "ok=1" in tui.status_message
+
+
+def test_current_provider_summary_distinguishes_selected_from_next_request(monkeypatch) -> None:
+    data = {
+        "proxy": {"auto_failover": True},
+        "apps": {
+            "codex": {
+                "current": "a",
+                "providers": {
+                    "a": {"name": "YesCodex", "priority": 10, "base_url": "https://yes.example"},
+                    "b": {"name": "CodeZ", "priority": 20, "base_url": "https://codez.example"},
+                },
+            },
+            "claude": {"current": None, "providers": {}},
+        },
+    }
+    state = default_health_state()
+    state["apps"]["codex"]["a"] = {
+        "provider_name": "YesCodex",
+        "total_successes": 10,
+        "total_failures": 1,
+        "consecutive_failures": 3,
+        "last_success_at": time.time() - 120,
+        "last_failure_at": time.time() - 5,
+        "last_error": "boom",
+        "cooldown_until": time.time() + 60,
+    }
+
+    monkeypatch.setattr("ccproxy.read_models.load_config", lambda: data)
+    monkeypatch.setattr("ccproxy.read_models.load_health_state", lambda: state)
+
+    summary = build_current_provider_summary("codex")
+    assert summary["selected_provider_id"] == "a"
+    assert summary["effective_provider_id"] == "b"
+    assert summary["effective_matches_selected"] is False
+    assert "cooling down" in summary["effective_reason"]
+
+
+def test_health_snapshot_marks_next_request_provider(monkeypatch) -> None:
+    data = {
+        "proxy": {"auto_failover": True},
+        "apps": {
+            "codex": {
+                "current": "a",
+                "providers": {
+                    "a": {"name": "YesCodex", "priority": 10, "base_url": "https://yes.example"},
+                    "b": {"name": "CodeZ", "priority": 20, "base_url": "https://codez.example"},
+                },
+            },
+            "claude": {"current": None, "providers": {}},
+        },
+    }
+    state = default_health_state()
+    state["apps"]["codex"]["a"] = {
+        "provider_name": "YesCodex",
+        "total_successes": 10,
+        "total_failures": 1,
+        "consecutive_failures": 3,
+        "last_success_at": time.time() - 120,
+        "last_failure_at": time.time() - 5,
+        "last_error": "boom",
+        "cooldown_until": time.time() + 60,
+    }
+
+    monkeypatch.setattr("ccproxy.read_models.load_config", lambda: data)
+    monkeypatch.setattr("ccproxy.read_models.load_health_state", lambda: state)
+    monkeypatch.setattr("ccproxy.read_models.health_state_path", lambda: Path("/tmp/mock-health.json"))
+
+    snapshot = build_health_snapshot("codex")
+    rows = snapshot["apps"]["codex"]
+    yes_row = next(row for row in rows if row["provider_id"] == "a")
+    codez_row = next(row for row in rows if row["provider_id"] == "b")
+    assert yes_row["current"] is True
+    assert yes_row["effective"] is False
+    assert codez_row["effective"] is True
 
 
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:

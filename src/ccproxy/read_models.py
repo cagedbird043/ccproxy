@@ -14,6 +14,7 @@ from ccproxy.config import (
     proxy_runtime_status,
 )
 from ccproxy.health_store import ensure_provider_entry, format_timestamp, load_health_state, provider_in_cooldown
+from ccproxy.health_store import reorder_providers_by_cooldown
 
 
 def format_provider_label(provider_id: str, provider_name: str | None) -> str:
@@ -46,7 +47,25 @@ def build_provider_rows(app: str) -> list[dict[str, object]]:
 
 def build_current_provider_summary(app: str) -> dict[str, object]:
     data = load_config()
+    state = load_health_state()
+    app = normalize_app(app)
     provider_id, provider = current_provider(data, app)
+    ordered = ordered_provider_items(data, app)
+    effective_id, effective_provider = reorder_providers_by_cooldown(ordered, state, app)[0]
+    current_entry = ensure_provider_entry(
+        state,
+        app,
+        provider_id,
+        provider.get("name", provider_id),
+    )
+    current_in_cooldown = provider_in_cooldown(current_entry)
+    effective_matches_current = effective_id == provider_id
+    if effective_matches_current:
+        effective_reason = "selected provider will be tried first"
+    elif current_in_cooldown:
+        effective_reason = f"selected provider cooling down until {format_timestamp(current_entry.get('cooldown_until'))}"
+    else:
+        effective_reason = "runtime provider order currently prefers another provider"
     return {
         "app": app,
         "provider_id": provider_id,
@@ -54,6 +73,20 @@ def build_current_provider_summary(app: str) -> dict[str, object]:
         "priority": provider_priority(provider),
         "base_url": provider.get("base_url"),
         "label": format_provider_label(provider_id, provider.get("name", provider_id)),
+        "selected_provider_id": provider_id,
+        "selected_provider_name": provider.get("name", provider_id),
+        "selected_priority": provider_priority(provider),
+        "selected_base_url": provider.get("base_url"),
+        "selected_label": format_provider_label(provider_id, provider.get("name", provider_id)),
+        "selected_status": "cooldown" if current_in_cooldown else "ready",
+        "selected_cooldown_until": format_timestamp(current_entry.get("cooldown_until")),
+        "effective_provider_id": effective_id,
+        "effective_provider_name": effective_provider.get("name", effective_id),
+        "effective_priority": provider_priority(effective_provider),
+        "effective_base_url": effective_provider.get("base_url"),
+        "effective_label": format_provider_label(effective_id, effective_provider.get("name", effective_id)),
+        "effective_matches_selected": effective_matches_current,
+        "effective_reason": effective_reason,
     }
 
 
@@ -67,6 +100,7 @@ def build_health_snapshot(app: str | None = None) -> dict[str, object]:
         current = config["apps"][app_name]["current"]
         rows: list[dict[str, object]] = []
         ordered = ordered_provider_items(config, app_name)
+        effective_id = reorder_providers_by_cooldown(ordered, state, app_name)[0][0] if ordered else None
         for provider_id, provider in ordered:
             entry = ensure_provider_entry(
                 state,
@@ -81,6 +115,7 @@ def build_health_snapshot(app: str | None = None) -> dict[str, object]:
                     "base_url": provider.get("base_url", ""),
                     "priority": provider_priority(provider),
                     "current": provider_id == current,
+                    "effective": provider_id == effective_id,
                     "status": "cooldown" if provider_in_cooldown(entry) else "ready",
                     "total_successes": entry["total_successes"],
                     "total_failures": entry["total_failures"],
@@ -107,9 +142,12 @@ def build_dashboard_snapshot() -> dict[str, object]:
         current_id = current_provider_id(config, app_name)
         provider_rows = health["apps"][app_name]
         current_row = next((row for row in provider_rows if row["provider_id"] == current_id), None)
+        effective_row = next((row for row in provider_rows if row.get("effective")), None)
         apps[app_name] = {
             "current_provider_id": current_id,
             "current_provider_name": None if current_row is None else current_row["provider_name"],
+            "effective_provider_id": None if effective_row is None else effective_row["provider_id"],
+            "effective_provider_name": None if effective_row is None else effective_row["provider_name"],
             "providers": provider_rows,
         }
 

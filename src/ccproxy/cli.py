@@ -429,10 +429,32 @@ def print_provider_list(app: str) -> None:
 
 def print_current(app: str) -> None:
     summary = build_current_provider_summary(app)
-    print(t(
-        f"{app}: {summary['label']} p={summary['priority']} -> {summary['base_url']}",
-        f"{app}: {summary['label']} p={summary['priority']} -> {summary['base_url']}",
-    ))
+    print(
+        t(
+            f"{app}: {summary['selected_label']} p={summary['selected_priority']} -> {summary['selected_base_url']}",
+            f"{app}: {summary['selected_label']} p={summary['selected_priority']} -> {summary['selected_base_url']}",
+        )
+    )
+    if summary["effective_matches_selected"]:
+        print(
+            t(
+                f"next request: {summary['effective_label']} (same as selected)",
+                f"下一次请求: {summary['effective_label']}（和手动主 provider 一致）",
+            )
+        )
+    else:
+        print(
+            t(
+                f"next request: {summary['effective_label']} p={summary['effective_priority']} -> {summary['effective_base_url']}",
+                f"下一次请求: {summary['effective_label']} p={summary['effective_priority']} -> {summary['effective_base_url']}",
+            )
+        )
+        print(
+            t(
+                f"reason: {summary['effective_reason']}",
+                f"原因: {summary['effective_reason']}",
+            )
+        )
 
 
 def cmd_show(app: str, selector: str) -> int:
@@ -633,9 +655,11 @@ def cmd_health(app: str | None, json_mode: bool) -> int:
         if not rows:
             print(t("  no providers configured", "  没有配置 provider"))
             continue
+        print(t("  legend: * selected   ! next request", "  图例: * 手动主 provider   ! 下一次请求"))
         for row in rows:
-            marker = "*" if row["current"] else " "
-            print(f"{marker} p={row['priority']:<4} {row['provider_id']:24} {row['provider_name']:24} {row['status']:8} succ={row['total_successes']} fail={row['total_failures']} cfail={row['consecutive_failures']}")
+            selected_marker = "*" if row["current"] else " "
+            effective_marker = "!" if row.get("effective") else " "
+            print(f"{selected_marker}{effective_marker} p={row['priority']:<4} {row['provider_id']:24} {row['provider_name']:24} {row['status']:8} succ={row['total_successes']} fail={row['total_failures']} cfail={row['consecutive_failures']}")
             print(f"  last_ok={row['last_success_at']} last_fail={row['last_failure_at']} cooldown_until={row['cooldown_until']}")
             if row["last_error"]:
                 print(f"  last_error={row['last_error']}")

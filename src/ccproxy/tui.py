@@ -170,14 +170,18 @@ class CCProxyTUI:
         proxy = self.dashboard.get("proxy", {})
         proxy_state = self.t("running", "运行中") if proxy.get("running") else self.t("stopped", "已停止")
         header1 = f"ccproxy TUI | app={self.current_app} | proxy={proxy_state} | healthy={'yes' if proxy.get('healthy') else 'no'}"
-        current_id = self.dashboard.get("apps", {}).get(self.current_app, {}).get("current_provider_id")
-        current_name = self.dashboard.get("apps", {}).get(self.current_app, {}).get("current_provider_name")
+        app_snapshot = self.dashboard.get("apps", {}).get(self.current_app, {})
+        current_id = app_snapshot.get("current_provider_id")
+        current_name = app_snapshot.get("current_provider_name")
+        effective_id = app_snapshot.get("effective_provider_id")
+        effective_name = app_snapshot.get("effective_provider_name")
         current_label = self.t("none", "无") if not current_id else format_provider_label(str(current_id), None if current_name is None else str(current_name))
+        effective_label = self.t("none", "无") if not effective_id else format_provider_label(str(effective_id), None if effective_name is None else str(effective_name))
         status_message = self.status_message
         if self.is_busy():
             spinner = "|/-\\"[int(time.monotonic() * 8) % 4]
             status_message = f"{spinner} {status_message}"
-        header2 = f"current={current_label} | providers={len(self.rows)} | {status_message}"
+        header2 = f"selected={current_label} | next={effective_label} | providers={len(self.rows)} | {status_message}"
         self.add_line(stdscr, 0, 0, header1, width - 1, curses.A_BOLD)
         self.add_line(stdscr, 1, 0, header2, width - 1)
         self.draw_hline(stdscr, 2, 0, width)
@@ -193,9 +197,10 @@ class CCProxyTUI:
             selected = (start + offset) == self.selected_index
             marker = ">" if selected else " "
             current = "*" if row["current"] else " "
+            effective = "!" if row.get("effective") else " "
             status = str(row["status"])
             line = (
-                f"{marker}{current} p={row['priority']:<4} "
+                f"{marker}{current}{effective} p={row['priority']:<4} "
                 f"{row['provider_id']:<20} {self.truncate(str(row['provider_name']), 20):<20} "
                 f"{status:<8} cf={row['consecutive_failures']}"
             )
