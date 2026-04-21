@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import curses
+import queue
+import threading
+import time
 import unicodedata
-from typing import Callable
+from typing import Any, Callable
 
 from ccproxy.actions import (
     add_provider_action,
-    build_test_snapshot,
     delete_provider_action,
+    iter_test_rows,
     proxy_down_action,
     proxy_up_action,
     run_check_action,
     update_provider_action,
+    update_test_summary,
     use_provider_action,
 )
-from ccproxy.config import APP_CHOICES
+from ccproxy.config import APP_CHOICES, current_provider_id, load_config, ordered_provider_items
 from ccproxy.read_models import build_dashboard_snapshot, build_health_snapshot, format_provider_label
 
 
@@ -32,6 +36,11 @@ class CCProxyTUI:
         self.screen: curses.window | None = None
         self.dashboard: dict[str, object] = {"proxy": {}, "apps": {}}
         self.rows: list[dict[str, object]] = []
+        self.background_job: dict[str, Any] | None = None
+        self.pending_popup: tuple[list[str], str | None] | None = None
+
+    def is_busy(self) -> bool:
+        return self.background_job is not None
 
     def t(self, en: str, zh: str) -> str:
         return zh if self.lang == "zh" else en
@@ -47,13 +56,26 @@ class CCProxyTUI:
         self.screen = stdscr
         curses.curs_set(0)
         curses.use_default_colors()
-        stdscr.nodelay(False)
         stdscr.keypad(True)
         self.refresh_data()
 
         while True:
+            self.poll_background_job()
+            if self.pending_popup is not None:
+                lines, title = self.pending_popup
+                self.pending_popup = None
+                self.show_popup(lines, title)
             self.draw()
+            stdscr.timeout(100 if self.is_busy() else -1)
             key = stdscr.getch()
+            self.poll_background_job()
+            if self.pending_popup is not None:
+                lines, title = self.pending_popup
+                self.pending_popup = None
+                self.show_popup(lines, title)
+                continue
+            if key == -1:
+                continue
             if not self.handle_key(key):
                 return 0
 
@@ -151,7 +173,11 @@ class CCProxyTUI:
         current_id = self.dashboard.get("apps", {}).get(self.current_app, {}).get("current_provider_id")
         current_name = self.dashboard.get("apps", {}).get(self.current_app, {}).get("current_provider_name")
         current_label = self.t("none", "无") if not current_id else format_provider_label(str(current_id), None if current_name is None else str(current_name))
-        header2 = f"current={current_label} | providers={len(self.rows)} | {self.status_message}"
+        status_message = self.status_message
+        if self.is_busy():
+            spinner = "|/-\\"[int(time.monotonic() * 8) % 4]
+            status_message = f"{spinner} {status_message}"
+        header2 = f"current={current_label} | providers={len(self.rows)} | {status_message}"
         self.add_line(stdscr, 0, 0, header1, width - 1, curses.A_BOLD)
         self.add_line(stdscr, 1, 0, header2, width - 1)
         self.draw_hline(stdscr, 2, 0, width)
@@ -212,6 +238,9 @@ class CCProxyTUI:
             self.selected_index = 0
             self.refresh_data()
             return True
+        if self.is_busy():
+            self.set_status(self.t("Task still running; wait for it to finish", "任务仍在运行，请等待完成"))
+            return True
         if key in (ord("r"),):
             self.refresh_data()
             self.set_status(self.t("Refreshed", "已刷新"))
@@ -247,6 +276,123 @@ class CCProxyTUI:
             self.show_help_popup()
             return True
         return True
+
+    def start_background_job(
+        self,
+        *,
+        kind: str,
+        busy_message: str,
+        worker: Callable[[queue.SimpleQueue[dict[str, Any]]], dict[str, Any]],
+    ) -> bool:
+        if self.is_busy():
+            self.set_status(self.t("Task still running; wait for it to finish", "任务仍在运行，请等待完成"))
+            return False
+
+        updates: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
+
+        def runner() -> None:
+            try:
+                payload = worker(updates)
+            except Exception as exc:
+                updates.put({"type": "error", "message": str(exc)})
+                return
+            updates.put({"type": "complete", "kind": kind, "payload": payload})
+
+        thread = threading.Thread(target=runner, daemon=True)
+        self.background_job = {"kind": kind, "queue": updates, "thread": thread}
+        self.status_message = busy_message
+        thread.start()
+        return True
+
+    def poll_background_job(self) -> None:
+        if not self.is_busy():
+            return
+        assert self.background_job is not None
+        updates: queue.SimpleQueue[dict[str, Any]] = self.background_job["queue"]
+        while True:
+            try:
+                event = updates.get_nowait()
+            except queue.Empty:
+                break
+            self.handle_background_event(event)
+
+    def handle_background_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type == "progress":
+            self.handle_background_progress(event)
+            return
+
+        if event_type == "error":
+            self.background_job = None
+            self.set_status(self.t(f"Task failed: {event['message']}", f"任务失败: {event['message']}"))
+            return
+
+        if event_type == "complete":
+            kind = str(event["kind"])
+            payload = event["payload"]
+            self.background_job = None
+            if kind == "check":
+                self.finish_check_job(payload)
+                return
+            if kind == "test":
+                self.finish_test_job(payload)
+                return
+
+    def handle_background_progress(self, event: dict[str, Any]) -> None:
+        kind = event.get("kind")
+        if kind == "test-row":
+            row = event["row"]
+            index = int(event["index"])
+            total = int(event["total"])
+            state = self.t("OK", "成功") if row["success"] else self.t("FAIL", "失败")
+            self.status_message = self.t(
+                f"testing {event['app']} {index}/{total}: {row['provider_name']} {state}",
+                f"正在测试 {event['app']} {index}/{total}: {row['provider_name']} {state}",
+            )
+
+    def finish_check_job(self, payload: dict[str, Any]) -> None:
+        result = payload["result"]
+        detail = result.stderr.strip() or result.stdout.strip() or result.summary
+        self.pending_popup = (
+            [
+                f"app={result.app}",
+                f"provider={format_provider_label(result.provider_id, result.provider_name)}",
+                f"success={result.success}",
+                f"duration={result.duration_sec:.1f}s",
+                self.truncate(detail, 200),
+            ],
+            self.t("Check result", "检查结果"),
+        )
+        self.refresh_data()
+        status = self.t("OK", "成功") if result.success else self.t("FAIL", "失败")
+        self.set_status(f"[{status}] {result.provider_id} {result.duration_sec:.1f}s")
+
+    def finish_test_job(self, payload: dict[str, Any]) -> None:
+        summary = payload["summary"]
+        rows = payload["rows"]
+        lines = []
+        for row in rows[:10]:
+            state = self.t("OK", "成功") if row["success"] else self.t("FAIL", "失败")
+            lines.append(f"[{state}] {row['provider_id']} {row['duration_sec']:.1f}s")
+            if row["detail"]:
+                lines.append(f"  {self.truncate(str(row['detail']), 120)}")
+        lines.append(
+            self.t(
+                f"summary: ok={summary['ok']} fail={summary['fail']} total={summary['total']}",
+                f"汇总: 成功={summary['ok']} 失败={summary['fail']} 总计={summary['total']}",
+            )
+        )
+        self.pending_popup = (
+            lines,
+            self.t(f"Test {payload['app']}", f"测试 {payload['app']}"),
+        )
+        self.refresh_data()
+        self.set_status(
+            self.t(
+                f"test {payload['app']}: ok={summary['ok']} fail={summary['fail']}",
+                f"测试 {payload['app']}: 成功={summary['ok']} 失败={summary['fail']}",
+            )
+        )
 
     def show_popup(self, lines: list[str], title: str | None = None) -> None:
         assert self.screen is not None
@@ -322,52 +468,57 @@ class CCProxyTUI:
         if row is None:
             self.set_status(self.t("No provider selected", "未选中 provider"))
             return
-        self.set_status(self.t("Running check…", "正在运行检查…"), refresh=True)
-        try:
-            result = run_check_action(self.current_app, str(row["provider_id"]))
-        except Exception as exc:
-            self.set_status(self.t(f"check failed: {exc}", f"检查失败: {exc}"))
-            return
-        detail = result.stderr.strip() or result.stdout.strip() or result.summary
-        self.show_popup(
-            [
-                f"app={result.app}",
-                f"provider={format_provider_label(result.provider_id, result.provider_name)}",
-                f"success={result.success}",
-                f"duration={result.duration_sec:.1f}s",
-                self.truncate(detail, 200),
-            ],
-            title=self.t("Check result", "检查结果"),
+        app_name = self.current_app
+        provider_id = str(row["provider_id"])
+        provider_label = format_provider_label(provider_id, str(row["provider_name"]))
+
+        def worker(_updates: queue.SimpleQueue[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "app": app_name,
+                "provider_id": provider_id,
+                "result": run_check_action(app_name, provider_id),
+                "provider_label": provider_label,
+            }
+
+        self.start_background_job(
+            kind="check",
+            busy_message=self.t(f"Checking {provider_label}…", f"正在检查 {provider_label}…"),
+            worker=worker,
         )
-        self.refresh_data()
-        status = self.t("OK", "成功") if result.success else self.t("FAIL", "失败")
-        self.set_status(f"[{status}] {result.provider_id} {result.duration_sec:.1f}s")
 
     def test_current_app(self) -> None:
-        self.set_status(self.t(f"Testing {self.current_app}…", f"正在测试 {self.current_app}…"), refresh=True)
-        try:
-            snapshot = build_test_snapshot(self.current_app)
-        except Exception as exc:
-            self.set_status(self.t(f"test failed: {exc}", f"测试失败: {exc}"))
+        app_name = self.current_app
+        data = load_config()
+        ordered = ordered_provider_items(data, app_name)
+        if not ordered:
+            self.set_status(self.t("No providers configured", "没有配置 provider"))
             return
-        rows = snapshot["apps"][self.current_app]
-        summary = snapshot["summary"]
-        lines = []
-        for row in rows[:10]:
-            state = self.t("OK", "成功") if row["success"] else self.t("FAIL", "失败")
-            lines.append(f"[{state}] {row['provider_id']} {row['duration_sec']:.1f}s")
-            if row["detail"]:
-                lines.append(f"  {self.truncate(str(row['detail']), 120)}")
-        lines.append(self.t(
-            f"summary: ok={summary['ok']} fail={summary['fail']} total={summary['total']}",
-            f"汇总: 成功={summary['ok']} 失败={summary['fail']} 总计={summary['total']}",
-        ))
-        self.show_popup(lines, title=self.t(f"Test {self.current_app}", f"测试 {self.current_app}"))
-        self.refresh_data()
-        self.set_status(self.t(
-            f"test {self.current_app}: ok={summary['ok']} fail={summary['fail']}",
-            f"测试 {self.current_app}: 成功={summary['ok']} 失败={summary['fail']}",
-        ))
+        current = current_provider_id(data, app_name)
+
+        def worker(updates: queue.SimpleQueue[dict[str, Any]]) -> dict[str, Any]:
+            summary = {"ok": 0, "fail": 0, "total": 0}
+            rows = []
+            total = len(ordered)
+            for index, row in enumerate(iter_test_rows(app_name, ordered, current), start=1):
+                rows.append(row)
+                update_test_summary(summary, row)
+                updates.put(
+                    {
+                        "type": "progress",
+                        "kind": "test-row",
+                        "app": app_name,
+                        "index": index,
+                        "total": total,
+                        "row": row,
+                    }
+                )
+            return {"app": app_name, "rows": rows, "summary": summary}
+
+        self.start_background_job(
+            kind="test",
+            busy_message=self.t(f"Testing {app_name}…", f"正在测试 {app_name}…"),
+            worker=worker,
+        )
 
     def show_health_popup(self) -> None:
         row = self.selected_row()

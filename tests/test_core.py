@@ -459,6 +459,50 @@ def test_tui_truncate_clips_by_terminal_cells_not_codepoints() -> None:
     assert clipped.endswith("…")
 
 
+def test_tui_background_test_progress_updates_status() -> None:
+    tui = CCProxyTUI()
+    tui.background_job = {"kind": "test"}
+    tui.handle_background_event(
+        {
+            "type": "progress",
+            "kind": "test-row",
+            "app": "codex",
+            "index": 1,
+            "total": 3,
+            "row": {"provider_name": "YesCodex", "success": True},
+        }
+    )
+    assert "1/3" in tui.status_message
+    assert "YesCodex" in tui.status_message
+
+
+def test_tui_background_test_complete_queues_popup_and_clears_busy(monkeypatch) -> None:
+    tui = CCProxyTUI()
+    tui.background_job = {"kind": "test"}
+    monkeypatch.setattr(tui, "refresh_data", lambda: None)
+    tui.handle_background_event(
+        {
+            "type": "complete",
+            "kind": "test",
+            "payload": {
+                "app": "codex",
+                "rows": [
+                    {
+                        "provider_id": "demo",
+                        "duration_sec": 1.2,
+                        "success": True,
+                        "detail": None,
+                    }
+                ],
+                "summary": {"ok": 1, "fail": 0, "total": 1},
+            },
+        }
+    )
+    assert tui.background_job is None
+    assert tui.pending_popup is not None
+    assert "ok=1" in tui.status_message
+
+
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:
     data = default_config()
     monkeypatch.setattr("ccproxy.config.remove_stale_pid_file", lambda: None)
