@@ -42,6 +42,7 @@ from ccproxy.proxy import (
     summarize_upstream_error,
 )
 from ccproxy.service import build_unit
+from ccproxy.tui import CCProxyTUI
 
 
 def test_resolve_provider_selector_prefers_id() -> None:
@@ -442,6 +443,20 @@ def test_bare_non_tty_fallback_prints_guidance(capsys) -> None:
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "interactive TUI requires a real terminal" in captured.err
+
+
+def test_tui_display_width_handles_wide_characters() -> None:
+    tui = CCProxyTUI()
+    assert tui.display_width("Press q to quit") == len("Press q to quit")
+    assert tui.display_width("按 q 退出") == 9
+
+
+def test_tui_truncate_clips_by_terminal_cells_not_codepoints() -> None:
+    tui = CCProxyTUI()
+    text = "Tab 切 app  ↑↓/jk 移动"
+    clipped = tui.truncate(text, 10)
+    assert tui.display_width(clipped) <= 10
+    assert clipped.endswith("…")
 
 
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:

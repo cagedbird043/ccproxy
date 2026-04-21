@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import curses
+import unicodedata
 from typing import Callable
 
 from ccproxy.actions import (
@@ -76,11 +77,61 @@ class CCProxyTUI:
     def truncate(self, text: str, width: int) -> str:
         if width <= 0:
             return ""
-        if len(text) <= width:
+        if self.display_width(text) <= width:
             return text
+
         if width == 1:
             return "…"
-        return text[: width - 1] + "…"
+
+        clipped = self.clip_to_width(text, width - 1)
+        if not clipped:
+            return "…"
+        return clipped + "…"
+
+    def char_width(self, char: str) -> int:
+        if not char:
+            return 0
+        if unicodedata.combining(char):
+            return 0
+        return 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+
+    def display_width(self, text: str) -> int:
+        return sum(self.char_width(char) for char in text)
+
+    def clip_to_width(self, text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        total = 0
+        parts: list[str] = []
+        for char in text:
+            char_cells = self.char_width(char)
+            if total + char_cells > width:
+                break
+            parts.append(char)
+            total += char_cells
+        return "".join(parts)
+
+    def add_line(self, window: curses.window, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
+        if width <= 0:
+            return
+        clipped = self.clip_to_width(text, width)
+        if not clipped:
+            return
+        try:
+            window.addstr(y, x, clipped, attr)
+        except curses.error:
+            pass
+
+    def draw_hline(self, window: curses.window, y: int, x: int, width: int) -> None:
+        if width <= 0:
+            return
+        try:
+            window.hline(y, x, curses.ACS_HLINE, width)
+        except curses.error:
+            try:
+                window.hline(y, x, curses.ACS_HLINE, max(0, width - 1))
+            except curses.error:
+                pass
 
     def draw(self) -> None:
         assert self.screen is not None
@@ -88,9 +139,9 @@ class CCProxyTUI:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         if height < 18 or width < 60:
-            stdscr.addnstr(0, 0, self.t("Terminal too small for ccproxy TUI", "终端太小，无法显示 ccproxy TUI"), width - 1)
-            stdscr.addnstr(2, 0, self.t("Need at least 60x18. Resize or use CLI subcommands.", "至少需要 60x18。请调整终端大小或使用 CLI 子命令。"), width - 1)
-            stdscr.addnstr(height - 1, 0, self.t("Press q to quit", "按 q 退出"), width - 1)
+            self.add_line(stdscr, 0, 0, self.t("Terminal too small for ccproxy TUI", "终端太小，无法显示 ccproxy TUI"), width - 1)
+            self.add_line(stdscr, 2, 0, self.t("Need at least 60x18. Resize or use CLI subcommands.", "至少需要 60x18。请调整终端大小或使用 CLI 子命令。"), width - 1)
+            self.add_line(stdscr, height - 1, 0, self.t("Press q to quit", "按 q 退出"), width - 1)
             stdscr.refresh()
             return
 
@@ -101,9 +152,9 @@ class CCProxyTUI:
         current_name = self.dashboard.get("apps", {}).get(self.current_app, {}).get("current_provider_name")
         current_label = self.t("none", "无") if not current_id else format_provider_label(str(current_id), None if current_name is None else str(current_name))
         header2 = f"current={current_label} | providers={len(self.rows)} | {self.status_message}"
-        stdscr.addnstr(0, 0, self.truncate(header1, width - 1), width - 1, curses.A_BOLD)
-        stdscr.addnstr(1, 0, self.truncate(header2, width - 1), width - 1)
-        stdscr.hline(2, 0, curses.ACS_HLINE, width)
+        self.add_line(stdscr, 0, 0, header1, width - 1, curses.A_BOLD)
+        self.add_line(stdscr, 1, 0, header2, width - 1)
+        self.draw_hline(stdscr, 2, 0, width)
 
         list_top = 3
         list_bottom = height - 5
@@ -123,12 +174,12 @@ class CCProxyTUI:
                 f"{status:<8} cf={row['consecutive_failures']}"
             )
             attr = curses.A_REVERSE if selected else curses.A_NORMAL
-            stdscr.addnstr(line_y, 0, self.truncate(line, width - 1), width - 1, attr)
+            self.add_line(stdscr, line_y, 0, line, width - 1, attr)
 
         if not self.rows:
-            stdscr.addnstr(list_top, 0, self.t("No providers configured for this app. Press a to add one.", "这个 app 还没有 provider。按 a 添加。"), width - 1)
+            self.add_line(stdscr, list_top, 0, self.t("No providers configured for this app. Press a to add one.", "这个 app 还没有 provider。按 a 添加。"), width - 1)
 
-        stdscr.hline(height - 4, 0, curses.ACS_HLINE, width)
+        self.draw_hline(stdscr, height - 4, 0, width)
         row = self.selected_row()
         if row is None:
             detail1 = self.t("No provider selected", "当前没有选中 provider")
@@ -136,13 +187,13 @@ class CCProxyTUI:
         else:
             detail1 = f"base={row['base_url']} | model={row.get('model') or '-'} | auth={row.get('auth_mode') or '-'}"
             detail2 = f"error={row.get('last_error') or '-'}"
-        stdscr.addnstr(height - 3, 0, self.truncate(detail1, width - 1), width - 1)
-        stdscr.addnstr(height - 2, 0, self.truncate(detail2, width - 1), width - 1)
+        self.add_line(stdscr, height - 3, 0, detail1, width - 1)
+        self.add_line(stdscr, height - 2, 0, detail2, width - 1)
         keys = self.t(
             "Tab app  ↑↓/jk move  Enter/u use  c check  t test  h health  p proxy  x toggle-proxy  e edit  a add  d del  r refresh  q quit",
             "Tab 切 app  ↑↓/jk 移动  Enter/u 切换  c 检查  t 测试  h 健康  p 代理  x 切代理  e 编辑  a 添加  d 删除  r 刷新  q 退出",
         )
-        stdscr.addnstr(height - 1, 0, self.truncate(keys, width - 1), width - 1, curses.A_DIM)
+        self.add_line(stdscr, height - 1, 0, keys, width - 1, curses.A_DIM)
         stdscr.refresh()
 
     def handle_key(self, key: int) -> bool:
@@ -207,13 +258,14 @@ class CCProxyTUI:
         body.append("")
         body.append(self.t("Press any key to continue", "按任意键继续"))
         popup_h = min(height - 2, max(6, len(body) + 2))
-        popup_w = min(width - 2, max(40, min(width - 2, max(len(line) for line in body) + 4)))
+        body_width = max(self.display_width(line) for line in body) if body else 0
+        popup_w = min(width - 2, max(40, min(width - 2, body_width + 4)))
         top = max(1, (height - popup_h) // 2)
         left = max(1, (width - popup_w) // 2)
         win = curses.newwin(popup_h, popup_w, top, left)
         win.box()
         for idx, line in enumerate(body[: popup_h - 2], start=1):
-            win.addnstr(idx, 2, self.truncate(line, popup_w - 4), popup_w - 4)
+            self.add_line(win, idx, 2, line, popup_w - 4)
         win.refresh()
         win.getch()
         del win
@@ -227,9 +279,13 @@ class CCProxyTUI:
         curses.echo()
         self.screen.move(height - 1, 0)
         self.screen.clrtoeol()
-        self.screen.addnstr(height - 1, 0, self.truncate(label + ": ", width - 1), width - 1)
+        prompt_text = label + ": "
+        self.add_line(self.screen, height - 1, 0, prompt_text, width - 1)
         self.screen.refresh()
-        raw = self.screen.getstr(height - 1, min(width - 2, len(label) + 2), max(1, width - len(label) - 4))
+        prompt_width = self.display_width(self.clip_to_width(prompt_text, width - 2))
+        input_x = min(width - 2, prompt_width)
+        input_limit = max(1, width - input_x - 1)
+        raw = self.screen.getstr(height - 1, input_x, input_limit)
         curses.noecho()
         curses.curs_set(0)
         value = raw.decode(errors="replace").strip()
