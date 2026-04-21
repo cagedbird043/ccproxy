@@ -1,14 +1,15 @@
+import subprocess
 from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
-from ccproxy.checks import next_provider_candidates
+from ccproxy.checks import CHECK_TIMEOUT_RETURN_CODE, CheckResult, _run_subprocess, next_provider_candidates
 from ccproxy.completion import completion_provider_entries, completion_provider_ids, render_completion
-from ccproxy.checks import CheckResult
 from ccproxy.cli import (
     _check_detail,
     build_health_snapshot,
     build_parser,
     build_test_snapshot,
+    cmd_test,
     detect_cli_lang,
     format_provider_label,
 )
@@ -305,6 +306,7 @@ def test_render_bash_completion_mentions_complete_function() -> None:
     assert "cut -f1" in script
     assert "show" in script
     assert "--failure-threshold" in script
+    assert "--timeout-sec" in script
     assert "test" in script
 
 
@@ -316,6 +318,7 @@ def test_render_zsh_completion_mentions_compdef() -> None:
     assert "_complete-providers" in script
     assert "update provider config" in script
     assert "--retry-attempts" in script
+    assert "--timeout-sec" in script
     assert "batch test providers" in script
     assert "completion:print shell completion" not in script
 
@@ -326,12 +329,15 @@ def test_render_fish_completion_mentions_complete_directive() -> None:
     assert "_complete-providers $app" in script
     assert "show update delete" in script
     assert "check test next" in script
+    assert "timeout-sec" in script
     assert "claude completion" not in script
 
 
 def test_build_parser_hides_internal_completion_commands_from_help() -> None:
-    help_text = build_parser("en").format_help()
+    parser = build_parser("en")
+    help_text = parser.format_help()
     assert "test                Batch test providers" in help_text
+    assert parser.parse_args(["test", "codex", "--timeout-sec", "5"]).timeout_sec == 5
     assert "completion          ==SUPPRESS==" not in help_text
     assert "_complete-providers" not in help_text
     assert "_proxy-run" not in help_text
@@ -377,7 +383,11 @@ def test_build_test_snapshot_collects_results(monkeypatch) -> None:
         },
     )
 
-    def fake_run_check(app: str, selector: str | None = None) -> CheckResult:
+    def fake_run_check(
+        app: str,
+        selector: str | None = None,
+        timeout_sec: float | None = None,
+    ) -> CheckResult:
         provider_id = selector or "missing"
         return CheckResult(
             app=app,
@@ -413,6 +423,86 @@ def test_build_test_snapshot_collects_results(monkeypatch) -> None:
     assert rows[0]["detail"] is None
     assert rows[1]["provider_id"] == "a"
     assert rows[1]["detail"] == "ERROR: unexpected status 403 Forbidden: balance low"
+
+
+def test_run_subprocess_timeout_returns_human_readable_error(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=3,
+            output="partial stdout",
+            stderr="partial stderr",
+        )
+
+    monkeypatch.setattr("ccproxy.checks.subprocess.run", fake_run)
+
+    returncode, stdout, stderr, timed_out = _run_subprocess(["codex", "exec"], timeout_sec=3)
+
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert returncode == CHECK_TIMEOUT_RETURN_CODE
+    assert stdout == "partial stdout"
+    assert "partial stderr" in stderr
+    assert "ERROR: check timed out after 3s" in stderr
+    assert timed_out is True
+
+
+def test_cmd_test_text_mode_streams_rows_without_building_snapshot(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "ccproxy.cli.build_test_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("snapshot path should not be used")),
+    )
+    monkeypatch.setattr(
+        "ccproxy.cli.load_config",
+        lambda: {
+            "apps": {
+                "codex": {
+                    "current": "b",
+                    "providers": {
+                        "a": {"name": "A", "priority": 20},
+                        "b": {"name": "B", "priority": 10},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            }
+        },
+    )
+
+    seen_timeouts: list[float | None] = []
+
+    def fake_run_check(
+        app: str,
+        selector: str | None = None,
+        timeout_sec: float | None = None,
+    ) -> CheckResult:
+        seen_timeouts.append(timeout_sec)
+        provider_id = selector or "missing"
+        return CheckResult(
+            app=app,
+            provider_id=provider_id,
+            provider_name=provider_id.upper(),
+            success=(provider_id == "b"),
+            duration_sec=0.5 if provider_id == "b" else 1.0,
+            summary="healthy" if provider_id == "b" else "failed",
+            stdout="" if provider_id == "b" else "ERROR: boom",
+            stderr="",
+            returncode=0 if provider_id == "b" else 1,
+        )
+
+    monkeypatch.setattr("ccproxy.cli.run_check", fake_run_check)
+
+    exit_code = cmd_test("codex", json_mode=False, timeout_sec=7)
+    captured = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert seen_timeouts == [7, 7]
+    assert "[codex]" in captured
+    assert "* [OK]" in captured
+    assert "[FAIL]" in captured
+    assert "ERROR: boom" in captured
+    assert "summary: ok=1 fail=1 total=2" in captured
 
 
 def test_check_detail_prefers_result_field_from_json_error() -> None:

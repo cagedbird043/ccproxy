@@ -113,8 +113,14 @@ def render_bash_completion() -> str:
               update)
                 opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
                 ;;
+              check)
+                opts="--timeout-sec"
+                ;;
               test|health)
                 opts="--json"
+                if [[ "$cmd" == "test" ]]; then
+                  opts="$opts --timeout-sec"
+                fi
                 ;;
               service)
                 case "$subcmd" in
@@ -285,9 +291,24 @@ def render_zsh_completion() -> str:
               _arguments '2:app:(codex claude)'
               ;;
             test|health)
-              _arguments '--json[print result as json]' '2:app:(codex claude)'
+              if [[ "$words[2]" == "test" ]]; then
+                _arguments '--json[print result as json]' '--timeout-sec[per-provider timeout in seconds]:seconds:' '2:app:(codex claude)'
+              else
+                _arguments '--json[print result as json]' '2:app:(codex claude)'
+              fi
               ;;
-            show|delete|check|use)
+            check)
+              if (( CURRENT == 3 )); then
+                _values 'app' codex claude
+                return
+              fi
+              if (( CURRENT == 4 )); then
+                _ccproxy_provider_ids "$words[3]"
+                return
+              fi
+              _arguments '--timeout-sec[per-provider timeout in seconds]:seconds:'
+              ;;
+            show|delete|use)
               if (( CURRENT == 3 )); then
                 _values 'app' codex claude
                 return
@@ -442,6 +463,7 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l priority
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l set-current
         complete -c ccproxy -n '__fish_seen_subcommand_from health test' -l json
+        complete -c ccproxy -n '__fish_seen_subcommand_from check test' -l timeout-sec
 
         complete -c ccproxy -n '__fish_seen_subcommand_from codex' -l provider -a '(__fish_ccproxy_provider_ids codex)'
         complete -c ccproxy -n '__fish_seen_subcommand_from claude' -l provider -a '(__fish_ccproxy_provider_ids claude)'

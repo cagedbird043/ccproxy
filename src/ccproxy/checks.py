@@ -22,6 +22,8 @@ from ccproxy.config import (
 
 CHECK_MARKER = "CCPROXY_CHECK_OK"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CHECK_TIMEOUT_SEC = 45.0
+CHECK_TIMEOUT_RETURN_CODE = 124
 
 
 @dataclass
@@ -35,6 +37,7 @@ class CheckResult:
     stdout: str
     stderr: str
     returncode: int
+    timed_out: bool = False
 
 
 def _resolve_provider(
@@ -74,6 +77,58 @@ def _safe_link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _decode_subprocess_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
+def _format_timeout_sec(timeout_sec: float) -> str:
+    if float(timeout_sec).is_integer():
+        return str(int(timeout_sec))
+    return f"{timeout_sec:g}"
+
+
+def resolve_check_timeout(timeout_sec: float | None = None) -> float:
+    if timeout_sec is None:
+        raw = os.environ.get("CCPROXY_CHECK_TIMEOUT_SEC")
+        timeout_sec = float(raw) if raw else DEFAULT_CHECK_TIMEOUT_SEC
+
+    timeout_value = float(timeout_sec)
+    if timeout_value <= 0:
+        raise ValueError(f"invalid check timeout: {timeout_value}")
+    return timeout_value
+
+
+def _run_subprocess(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout_sec: float,
+) -> tuple[int, str, str, bool]:
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_sec,
+        )
+        return completed.returncode, completed.stdout, completed.stderr, False
+    except subprocess.TimeoutExpired as exc:
+        stdout = _decode_subprocess_text(exc.stdout)
+        stderr = _decode_subprocess_text(exc.stderr).rstrip()
+        timeout_line = f"ERROR: check timed out after {_format_timeout_sec(timeout_sec)}s"
+        if stderr:
+            stderr = f"{stderr}\n{timeout_line}\n"
+        else:
+            stderr = f"{timeout_line}\n"
+        return CHECK_TIMEOUT_RETURN_CODE, stdout, stderr, True
+
+
 def _prepare_codex_temp_home(temp_home: Path) -> None:
     real_home = _codex_home()
     if not real_home.exists():
@@ -86,7 +141,7 @@ def _prepare_codex_temp_home(temp_home: Path) -> None:
         _safe_link_or_copy(child, target)
 
 
-def _run_codex_check(provider: dict[str, Any]) -> tuple[int, str, str]:
+def _run_codex_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
     model = provider.get("model") or "gpt-5.4"
     with tempfile.TemporaryDirectory(prefix="ccproxy-codex-check-", dir=runtime_dir()) as temp_dir:
         temp_home = Path(temp_dir)
@@ -111,7 +166,7 @@ def _run_codex_check(provider: dict[str, Any]) -> tuple[int, str, str]:
         )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(temp_home)
-        completed = subprocess.run(
+        return _run_subprocess(
             [
                 "codex",
                 "exec",
@@ -120,14 +175,12 @@ def _run_codex_check(provider: dict[str, Any]) -> tuple[int, str, str]:
                 model,
                 f"Reply with exactly {CHECK_MARKER}",
             ],
-            capture_output=True,
-            text=True,
             env=env,
+            timeout_sec=timeout_sec,
         )
-        return completed.returncode, completed.stdout, completed.stderr
 
 
-def _run_claude_check(provider: dict[str, Any]) -> tuple[int, str, str]:
+def _run_claude_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
     with tempfile.NamedTemporaryFile(
         mode="w",
         prefix="ccproxy-claude-check-",
@@ -150,7 +203,7 @@ def _run_claude_check(provider: dict[str, Any]) -> tuple[int, str, str]:
         handle.write("\n")
 
     try:
-        completed = subprocess.run(
+        return _run_subprocess(
             [
                 "claude",
                 "--settings",
@@ -167,25 +220,24 @@ def _run_claude_check(provider: dict[str, Any]) -> tuple[int, str, str]:
                 "0.05",
                 f"Reply with exactly {CHECK_MARKER}",
             ],
-            capture_output=True,
-            text=True,
+            timeout_sec=timeout_sec,
         )
-        return completed.returncode, completed.stdout, completed.stderr
     finally:
         settings_path.unlink(missing_ok=True)
 
 
-def run_check(app: str, selector: str | None = None) -> CheckResult:
+def run_check(app: str, selector: str | None = None, timeout_sec: float | None = None) -> CheckResult:
+    timeout_sec = resolve_check_timeout(timeout_sec)
     data = load_config()
     provider_id, provider = _resolve_provider(data, app, selector)
     name = provider.get("name", provider_id)
 
     started = time.monotonic()
     if app == "codex":
-        returncode, stdout, stderr = _run_codex_check(provider)
+        returncode, stdout, stderr, timed_out = _run_codex_check(provider, timeout_sec)
         success = returncode == 0 and CHECK_MARKER in stdout
     elif app == "claude":
-        returncode, stdout, stderr = _run_claude_check(provider)
+        returncode, stdout, stderr, timed_out = _run_claude_check(provider, timeout_sec)
         success = returncode == 0
     else:
         raise ValueError(f"unsupported app: {app}")
@@ -193,6 +245,8 @@ def run_check(app: str, selector: str | None = None) -> CheckResult:
     duration = time.monotonic() - started
     if success:
         summary = "healthy"
+    elif timed_out:
+        summary = "timeout"
     else:
         summary = "failed"
 
@@ -206,6 +260,7 @@ def run_check(app: str, selector: str | None = None) -> CheckResult:
         stdout=stdout,
         stderr=stderr,
         returncode=returncode,
+        timed_out=timed_out,
     )
 
 

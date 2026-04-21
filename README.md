@@ -95,8 +95,10 @@ ccproxy import-cc-switch
 ccproxy list codex
 ccproxy list claude
 ccproxy check codex
+ccproxy check codex --timeout-sec 20
 ccproxy check claude
 ccproxy test codex
+ccproxy test codex --timeout-sec 20
 ccproxy test
 ccproxy health
 ccproxy health --json
@@ -162,12 +164,17 @@ ccproxy use claude fallback-claude
 ccproxy test codex
 ccproxy test claude
 ccproxy test --json
+ccproxy test codex --timeout-sec 20
 
 ccproxy next codex
 ccproxy next claude
 ```
 
 当前会话不会被重启。下一次发起请求时会走新 provider。
+
+`ccproxy test` 普通文本模式现在会边测边打印：每个 provider 一测完就立刻输出，不再等整批全部结束后才统一返回。
+如果只是想快速排雷，可以配合 `--timeout-sec` 给单个 provider 设更短超时，例如 `ccproxy test codex --timeout-sec 15`。
+只有 `--json` 模式为了保持合法 JSON，仍然会等整批完成后一次性输出。
 
 ### 6. 开机自启
 
