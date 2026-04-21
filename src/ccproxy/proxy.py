@@ -37,10 +37,38 @@ ERROR_BODY_PREVIEW_BYTES = 16 * 1024
 ERROR_DETAIL_LIMIT = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+QUOTA_EXHAUSTED_TERMS = (
+    "quota exceeded",
+    "quota has been exhausted",
+    "exceeded your current quota",
+    "insufficient_quota",
+    "insufficient quota",
+    "quota low",
+    "billing hard limit",
+    "credit balance",
+    "insufficient balance",
+    "balance is too low",
+    "balance too low",
+    "余额不足",
+    "额度不足",
+    "配额不足",
+    "配额已用尽",
+)
 
 
 def should_failover_status(status_code: int) -> bool:
     return status_code in FAILOVER_STATUS_CODES
+
+
+def is_quota_exhausted_detail(detail: str | None) -> bool:
+    if not detail:
+        return False
+    normalized = _normalize_text(detail).casefold()
+    return any(term in normalized for term in QUOTA_EXHAUSTED_TERMS)
+
+
+def should_failover_response(status_code: int, detail: str | None = None) -> bool:
+    return should_failover_status(status_code) or is_quota_exhausted_detail(detail)
 
 
 def _truncate_detail(text: str, limit: int = ERROR_DETAIL_LIMIT) -> str:
@@ -255,17 +283,24 @@ async def forward(request: web.Request) -> web.StreamResponse:
                     headers=headers,
                     data=body,
                 ) as upstream:
-                    should_retry_same_provider = (
-                        should_failover_status(upstream.status)
-                        and retry_index + 1 < retry_attempts
-                    )
-                    if should_retry_same_provider:
+                    error_detail: str | None = None
+                    quota_exhausted = False
+                    if not (200 <= upstream.status < 300):
                         error_body = await upstream.read()
                         error_detail = summarize_upstream_error(
                             upstream.status,
                             upstream.headers,
                             error_body,
                         )
+                        last_error = error_detail
+                        quota_exhausted = is_quota_exhausted_detail(error_detail)
+
+                    should_retry_same_provider = (
+                        should_failover_status(upstream.status)
+                        and not quota_exhausted
+                        and retry_index + 1 < retry_attempts
+                    )
+                    if should_retry_same_provider:
                         logging.warning(
                             "provider %s returned %s for %s, retrying same provider (%s/%s): %s",
                             provider_id,
@@ -277,19 +312,10 @@ async def forward(request: web.Request) -> web.StreamResponse:
                         )
                         continue
 
-                    provider_failed = should_failover_status(upstream.status)
-                    if not (200 <= upstream.status < 300):
-                        error_body = await upstream.read()
-                        error_detail = summarize_upstream_error(
-                            upstream.status,
-                            upstream.headers,
-                            error_body,
-                        )
-                        last_error = error_detail
-                    else:
-                        error_detail = None
+                    provider_failed = should_failover_response(upstream.status, error_detail)
 
                     if provider_failed:
+                        effective_failure_threshold = 1 if quota_exhausted else failure_threshold
                         await _update_health_state(
                             request,
                             lambda state: record_failure(
@@ -299,7 +325,7 @@ async def forward(request: web.Request) -> web.StreamResponse:
                                 provider.get("name", provider_id),
                                 error_detail or last_error or "",
                                 cooldown_sec,
-                                failure_threshold,
+                                effective_failure_threshold,
                                 now_ts=time.time(),
                             ),
                         )

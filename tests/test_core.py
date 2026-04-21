@@ -37,8 +37,10 @@ from ccproxy.health_store import (
 from ccproxy.proxy import (
     build_proxy_error_payload,
     forward,
+    is_quota_exhausted_detail,
     make_app,
     provider_attempt_order,
+    should_failover_response,
     should_failover_status,
     summarize_upstream_error,
 )
@@ -149,6 +151,18 @@ def test_should_failover_status_is_conservative() -> None:
     assert should_failover_status(503) is True
     assert should_failover_status(401) is False
     assert should_failover_status(400) is False
+
+
+def test_quota_exhausted_detail_detects_hard_quota_messages() -> None:
+    assert is_quota_exhausted_detail("upstream status 403: quota exceeded for this key") is True
+    assert is_quota_exhausted_detail("upstream status 403: 用户额度不足") is True
+    assert is_quota_exhausted_detail("upstream status 403: invalid api key") is False
+
+
+def test_should_failover_response_allows_quota_403_without_broadening_all_403() -> None:
+    assert should_failover_response(403, "upstream status 403: quota exceeded") is True
+    assert should_failover_response(403, "upstream status 403: invalid api key") is False
+    assert should_failover_response(429, "upstream status 429: rate limit") is True
 
 
 def test_reorder_providers_moves_cooling_provider_to_end() -> None:
@@ -810,6 +824,175 @@ def test_forward_normalizes_unreadable_upstream_error_for_codex(monkeypatch) -> 
     assert payload["error"]["type"] == "api_error"
     assert payload["error"]["ccproxy_provider_id"] == "bad"
     assert payload["error"]["message"] == "bad: upstream status 403 with unreadable text/html error body"
+
+
+def test_forward_fails_over_on_quota_exceeded_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.proxy.load_config",
+        lambda: {
+            "proxy": {
+                "auto_failover": True,
+                "cooldown_sec": 60,
+                "failure_threshold": 3,
+                "retry_attempts": 3,
+            },
+            "apps": {
+                "codex": {
+                    "current": "bad",
+                    "providers": {
+                        "bad": {"name": "CodeZ", "base_url": "https://bad.example", "api_key": "k"},
+                        "good": {"name": "YesCodex", "base_url": "https://good.example", "api_key": "k"},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            },
+        },
+    )
+
+    class FakeContent:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        async def iter_chunked(self, _size: int):
+            for chunk in self._chunks:
+                yield chunk
+
+    class FakeUpstream:
+        def __init__(self, status: int, headers: dict[str, str], body: bytes = b"", chunks: list[bytes] | None = None):
+            self.status = status
+            self.headers = headers
+            self._body = body
+            self.content = FakeContent(chunks or [])
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeStreamResponse:
+        def __init__(self, *, status: int, headers: dict[str, str]):
+            self.status = status
+            self.headers = headers
+            self.body = b""
+
+        async def prepare(self, _request):
+            return self
+
+        async def write(self, chunk: bytes):
+            self.body += chunk
+
+        async def write_eof(self):
+            return None
+
+    class FakeSession:
+        def request(self, _method, url, **_kwargs):
+            if "bad.example" in url:
+                return FakeUpstream(
+                    403,
+                    {"Content-Type": "application/json"},
+                    b'{"error":{"message":"quota exceeded"}}',
+                )
+            return FakeUpstream(
+                200,
+                {"Content-Type": "application/json"},
+                chunks=[b'{"ok":true}'],
+            )
+
+    class FakeRequest:
+        def __init__(self):
+            self.path = "/responses"
+            self.path_qs = "/responses"
+            self.query_string = ""
+            self.method = "POST"
+            self.headers = {}
+            self.app = {
+                "session": FakeSession(),
+                "health_state": default_health_state(),
+                "health_lock": asyncio.Lock(),
+            }
+
+        async def read(self):
+            return b"{}"
+
+    monkeypatch.setattr("ccproxy.proxy.web.StreamResponse", FakeStreamResponse)
+
+    response = asyncio.run(forward(FakeRequest()))
+    assert response.status == 200
+    assert response.body == b'{"ok":true}'
+
+
+def test_forward_quota_exceeded_enters_cooldown_immediately(monkeypatch) -> None:
+    health_state = default_health_state()
+    monkeypatch.setattr(
+        "ccproxy.proxy.load_config",
+        lambda: {
+            "proxy": {
+                "auto_failover": False,
+                "cooldown_sec": 60,
+                "failure_threshold": 3,
+                "retry_attempts": 3,
+            },
+            "apps": {
+                "codex": {
+                    "current": "bad",
+                    "providers": {
+                        "bad": {"name": "CodeZ", "base_url": "https://bad.example", "api_key": "k"},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            },
+        },
+    )
+
+    class FakeContent:
+        async def iter_chunked(self, _size: int):
+            if False:
+                yield b""
+
+    class FakeUpstream:
+        def __init__(self):
+            self.status = 403
+            self.headers = {"Content-Type": "application/json"}
+            self.content = FakeContent()
+
+        async def read(self):
+            return b'{"error":{"message":"quota exceeded"}}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def request(self, *args, **kwargs):
+            return FakeUpstream()
+
+    class FakeRequest:
+        def __init__(self):
+            self.path = "/responses"
+            self.path_qs = "/responses"
+            self.query_string = ""
+            self.method = "POST"
+            self.headers = {}
+            self.app = {
+                "session": FakeSession(),
+                "health_state": health_state,
+                "health_lock": asyncio.Lock(),
+            }
+
+        async def read(self):
+            return b"{}"
+
+    response = asyncio.run(forward(FakeRequest()))
+    assert response.status == 403
+    entry = health_state["apps"]["codex"]["bad"]
+    assert entry["consecutive_failures"] == 1
+    assert entry["cooldown_until"] is not None
 
 
 def test_check_detail_prefers_result_field_from_json_error() -> None:
