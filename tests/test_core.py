@@ -5,12 +5,15 @@ from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
 from ccproxy.checks import CHECK_TIMEOUT_RETURN_CODE, CheckResult, _run_subprocess, next_provider_candidates
+from ccproxy.command_registry import visible_command_names
 from ccproxy.completion import completion_provider_entries, completion_provider_ids, render_completion
 from ccproxy.cli import (
     _check_detail,
     build_health_snapshot,
     build_parser,
     build_test_snapshot,
+    classify_invocation,
+    cmd_bare_non_tty_fallback,
     cmd_test,
     detect_cli_lang,
     format_provider_label,
@@ -348,6 +351,7 @@ def test_render_bash_completion_mentions_complete_function() -> None:
     assert "show" in script
     assert "--failure-threshold" in script
     assert "--timeout-sec" in script
+    assert "--json" in script
     assert "test" in script
 
 
@@ -379,9 +383,65 @@ def test_build_parser_hides_internal_completion_commands_from_help() -> None:
     help_text = parser.format_help()
     assert "test                Batch test providers" in help_text
     assert parser.parse_args(["test", "codex", "--timeout-sec", "5"]).timeout_sec == 5
+    assert parser.parse_args(["--json"]).dashboard_json is True
     assert "completion          ==SUPPRESS==" not in help_text
     assert "_complete-providers" not in help_text
     assert "_proxy-run" not in help_text
+
+
+def test_visible_command_registry_contains_expected_public_commands() -> None:
+    assert visible_command_names() == (
+        "init",
+        "import-cc-switch",
+        "add",
+        "list",
+        "current",
+        "show",
+        "update",
+        "delete",
+        "check",
+        "test",
+        "next",
+        "health",
+        "service",
+        "use",
+        "proxy",
+        "codex",
+        "claude",
+    )
+
+
+class _FakeTTY:
+    def __init__(self, is_tty: bool):
+        self._is_tty = is_tty
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+
+def test_classify_invocation_prefers_tui_for_bare_tty() -> None:
+    args = build_parser("en").parse_args([])
+    route = classify_invocation(args, _FakeTTY(True), _FakeTTY(True), {"TERM": "xterm-256color"})
+    assert route == "tui"
+
+
+def test_classify_invocation_prefers_dashboard_json_for_top_level_flag() -> None:
+    args = build_parser("en").parse_args(["--json"])
+    route = classify_invocation(args, _FakeTTY(True), _FakeTTY(True), {"TERM": "xterm-256color"})
+    assert route == "dashboard-json"
+
+
+def test_classify_invocation_falls_back_for_bare_non_tty() -> None:
+    args = build_parser("en").parse_args([])
+    route = classify_invocation(args, _FakeTTY(False), _FakeTTY(False), {"TERM": "xterm-256color"})
+    assert route == "fallback"
+
+
+def test_bare_non_tty_fallback_prints_guidance(capsys) -> None:
+    exit_code = cmd_bare_non_tty_fallback()
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "interactive TUI requires a real terminal" in captured.err
 
 
 def test_proxy_runtime_status_uses_health_probe_without_pid(monkeypatch) -> None:

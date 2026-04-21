@@ -18,6 +18,12 @@
 
 这样，`ccproxy use codex <provider>` 或 `ccproxy use claude <provider>` 会在下一次请求时立即生效，不需要重启当前前台会话。
 
+现在它的入口做成了双模式：
+
+- `ccproxy` 不带参数时：在真实终端里直接进入交互式 TUI，适合 SSH / tmux / Termux
+- `ccproxy --help`、`ccproxy --json`、以及所有显式子命令：保持非交互式 CLI
+- 如果不带参数但当前不是 TTY：不会硬启动 TUI，而是打印简短提示并以退出码 `2` 退出
+
 ## 当前范围
 
 当前版本已经可以作为 `Codex` / `Claude` 的日常切换代理使用。
@@ -49,8 +55,14 @@
 ```bash
 cd ccproxy
 ./install.sh
-ccproxy --help
+ccproxy
 ```
+
+装好以后：
+
+- 想进交互面板，直接 `ccproxy`
+- 想看传统命令说明，用 `ccproxy --help`
+- 想给脚本读取全局摘要，用 `ccproxy --json`
 
 如果你在本地开发这个仓库，希望改代码后命令立即生效：
 
@@ -74,6 +86,8 @@ ccproxy completion bash
 ccproxy completion fish
 ```
 
+`completion` 属于辅助命令：默认不会出现在主 `--help` 里，但会继续保留可调用性，方便你手工生成补全脚本。
+
 如果你本来就喜欢 `uv` 或 `pipx`，也可以：
 
 ```bash
@@ -83,13 +97,61 @@ pipx install .
 
 ## 快速开始
 
+### 0. 先看交互式 TUI
+
+在真实终端里直接运行：
+
+```bash
+ccproxy
+```
+
+这会进入一个面向终端的 `curses` TUI。默认显示：
+
+- 当前 app（`codex` / `claude`）
+- 当前 provider
+- 各 provider 的优先级、健康状态、连续失败次数
+- 本地 proxy 的运行状态
+
+常用按键：
+
+- `Tab`：切换 app
+- `↑↓` / `j k`：移动选择
+- `Enter` / `u`：切换到选中 provider
+- `c`：检查当前选中 provider
+- `t`：批量测试当前 app 的 provider
+- `h`：看健康详情
+- `p`：看 proxy 状态
+- `x`：尽可能切换后台 proxy 开关
+- `e` / `a` / `d`：编辑 / 添加 / 删除 provider
+- `q`：退出
+
+这个 TUI 的目标就是像 `htop` 那样，默认可直接进入，且能在 SSH / tmux 里用得住。
+
+如果当前不是交互式终端，比如脚本、管道或某些 agent 子进程里直接调用裸 `ccproxy`，它不会误起 TUI，而是提示你改用 `--help`、`--json` 或显式子命令。
+
 ### 1. 从现有 cc-switch 导入 provider
 
 ```bash
 ccproxy import-cc-switch
 ```
 
-### 2. 看看当前有哪些 provider
+### 2. 看看当前有哪些 provider / dashboard
+
+如果你想给脚本或 agent 一次性读取当前总览，可以用：
+
+```bash
+ccproxy --json
+```
+
+如果你是人直接在终端里看，通常更推荐直接跑：
+
+```bash
+ccproxy
+```
+
+它会给你一个更适合人工操作的总览面板。
+
+非交互式命令依然全部可用，例如：
 
 ```bash
 ccproxy list codex
@@ -310,7 +372,14 @@ ccproxy next claude
 - 手机 Termux
 - 无图形环境
 
-所以它从一开始就是 CLI first。
+所以它从一开始就是 terminal first。
+
+现在默认入口是 TUI，但本质上仍然是“终端优先”而不是“图形优先”：
+
+- 默认入口：交互式 TUI
+- 自动化 / 脚本：显式参数和子命令
+- 批处理集成：`--json`
+- SSH / tmux / Termux：一等公民
 
 ## License
 
@@ -324,4 +393,6 @@ MIT
 uv sync --dev
 uv run python -m pytest -q
 uv run ccproxy import-cc-switch
+uv run python -m ccproxy --help
+uv run python -m ccproxy --json
 ```

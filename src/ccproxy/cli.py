@@ -7,16 +7,30 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import TextIO
 
 from ccproxy import __version__
-from ccproxy.checks import DEFAULT_CHECK_TIMEOUT_SEC, next_provider_candidates, run_check
+from ccproxy.actions import (
+    add_provider_action,
+    build_test_snapshot as _build_test_snapshot,
+    check_detail,
+    delete_provider_action,
+    iter_test_rows,
+    next_provider_action,
+    proxy_config_set_action,
+    proxy_down_action,
+    proxy_up_action,
+    run_check_action,
+    update_provider_action,
+    update_test_summary,
+    use_provider_action,
+)
+from ccproxy.checks import DEFAULT_CHECK_TIMEOUT_SEC
+from ccproxy.command_registry import all_command_specs, command_spec, hidden_command_names, visible_command_names
 from ccproxy.completion import completion_provider_entries, render_completion
 from ccproxy.config import (
-    DEFAULT_PROVIDER_PRIORITY,
     APP_CHOICES,
-    current_provider,
     current_provider_id,
-    health_state_path,
     init_config,
     load_config,
     log_path,
@@ -26,61 +40,24 @@ from ccproxy.config import (
     proxy_config,
     proxy_max_body_bytes,
     proxy_runtime_status,
-    remove_provider,
-    resolve_provider_selector,
-    save_config,
-    set_current_provider,
     tail_file,
-    update_proxy_config,
-    upsert_provider,
 )
-from ccproxy.health_store import ensure_provider_entry, format_timestamp, load_health_state, provider_in_cooldown
 from ccproxy.importers import import_from_cc_switch
-from ccproxy.launch import (
-    launch_claude,
-    launch_codex,
-    start_proxy_background,
-    stop_proxy_background,
-)
+from ccproxy.launch import launch_claude, launch_codex
 from ccproxy.proxy import run_proxy
+from ccproxy.read_models import (
+    build_current_provider_summary,
+    build_dashboard_snapshot,
+    build_health_snapshot as _build_health_snapshot,
+    build_provider_rows,
+    format_provider_label as _format_provider_label,
+)
 from ccproxy.service import build_unit, current_username, install_service, resolve_ccproxy_executable, uninstall_service
+from ccproxy.tui import run_tui
 
 
 CLI_LANG = "en"
-CHECK_MARKER = "CCPROXY_CHECK_OK"
-CHECK_DETAIL_NOISE_PREFIXES = (
-    "Reading additional input from stdin...",
-    "OpenAI Codex ",
-    "workdir:",
-    "model:",
-    "provider:",
-    "approval:",
-    "sandbox:",
-    "reasoning effort:",
-    "reasoning summaries:",
-    "session id:",
-)
-CHECK_DETAIL_NOISE_LINES = {"--------", "user", CHECK_MARKER}
-
-PUBLIC_COMMANDS = (
-    "init",
-    "import-cc-switch",
-    "add",
-    "list",
-    "current",
-    "show",
-    "update",
-    "delete",
-    "check",
-    "test",
-    "next",
-    "health",
-    "service",
-    "use",
-    "proxy",
-    "codex",
-    "claude",
-)
+BARE_NON_TTY_EXIT_CODE = 2
 
 LANG_ALIASES = {
     "zh": "zh",
@@ -136,6 +113,217 @@ def _hide_subparser(subparsers, name: str) -> None:
     ]
 
 
+def _add_init_parser(sub) -> None:
+    sub.add_parser(command_spec("init").name, help=t(command_spec("init").help_en, command_spec("init").help_zh))
+
+
+def _add_import_parser(sub) -> None:
+    spec = command_spec("import-cc-switch")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument(
+        "--db-path",
+        default=str(Path.home() / ".cc-switch" / "cc-switch.db"),
+        help=t("Path to cc-switch.db.", "cc-switch.db 路径。"),
+    )
+
+
+def _add_add_parser(sub) -> None:
+    spec = command_spec("add")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+    parser.add_argument("id", help=t("Provider ID used inside ccproxy.", "ccproxy 内部使用的 provider ID。"))
+    parser.add_argument("--name", help=t("Human-readable provider name.", "便于识别的 provider 名称。"))
+    parser.add_argument("--base-url", required=True, help=t("Upstream base URL.", "上游 base URL。"))
+    parser.add_argument("--api-key", required=True, help=t("Upstream API key.", "上游 API key。"))
+    parser.add_argument("--model", help=t("Default model for Codex launcher.", "Codex 启动时默认模型。"))
+    parser.add_argument(
+        "--auth-mode",
+        choices=("bearer", "x-api-key", "both"),
+        help=t("Auth mode for Claude upstreams. Defaults to bearer for codex and claude.", "Claude 上游的鉴权模式；codex/claude 默认都是 bearer。"),
+    )
+    parser.add_argument("--set-current", action="store_true", help=t("Set this provider as current immediately.", "添加后立刻设为当前 provider。"))
+    parser.add_argument("--priority", type=int, help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"))
+
+
+def _add_list_parser(sub) -> None:
+    spec = command_spec("list")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
+
+
+def _add_current_parser(sub) -> None:
+    spec = command_spec("current")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
+
+
+def _add_show_parser(sub) -> None:
+    spec = command_spec("show")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+    parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
+
+
+def _add_update_parser(sub) -> None:
+    spec = command_spec("update")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+    parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
+    parser.add_argument("--name", help=t("Human-readable provider name.", "便于识别的 provider 名称。"))
+    parser.add_argument("--base-url", help=t("Upstream base URL.", "上游 base URL。"))
+    parser.add_argument("--api-key", help=t("Upstream API key.", "上游 API key。"))
+    parser.add_argument("--model", help=t("Default model for Codex launcher.", "Codex 启动时默认模型。"))
+    parser.add_argument("--auth-mode", choices=("bearer", "x-api-key", "both"), help=t("Auth mode for Claude upstreams.", "Claude 上游的鉴权模式。"))
+    parser.add_argument("--priority", type=int, help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"))
+    parser.add_argument("--set-current", action="store_true", help=t("Set this provider as current immediately.", "更新后立刻设为当前 provider。"))
+
+
+def _add_delete_parser(sub) -> None:
+    spec = command_spec("delete")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+    parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
+
+
+def _add_check_parser(sub) -> None:
+    spec = command_spec("check")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+    parser.add_argument("provider", nargs="?", help=t("Provider ID first, then exact provider name. Defaults to current provider.", "优先传 provider ID，其次精确名称；默认检查当前 provider。"))
+    parser.add_argument("--timeout-sec", type=float, help=t(f"Per-provider timeout in seconds. Defaults to {DEFAULT_CHECK_TIMEOUT_SEC:g}.", f"单个 provider 检查超时秒数；默认 {DEFAULT_CHECK_TIMEOUT_SEC:g} 秒。"))
+
+
+def _add_test_parser(sub) -> None:
+    spec = command_spec("test")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", nargs="?", choices=APP_CHOICES)
+    parser.add_argument("--json", action="store_true", help=t("Print test result as JSON.", "以 JSON 输出测试结果。"))
+    parser.add_argument("--timeout-sec", type=float, help=t(f"Per-provider timeout in seconds. Defaults to {DEFAULT_CHECK_TIMEOUT_SEC:g}.", f"单个 provider 检查超时秒数；默认 {DEFAULT_CHECK_TIMEOUT_SEC:g} 秒。"))
+
+
+def _add_next_parser(sub) -> None:
+    spec = command_spec("next")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+
+
+def _add_health_parser(sub) -> None:
+    spec = command_spec("health")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", nargs="?", choices=APP_CHOICES)
+    parser.add_argument("--json", action="store_true", help=t("Print health state as JSON.", "以 JSON 输出健康状态。"))
+
+
+def _add_service_parser(sub) -> None:
+    spec = command_spec("service")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    service_sub = parser.add_subparsers(dest="service_command", required=True)
+
+    install = service_sub.add_parser("install", help=t("Install a systemd unit.", "安装 systemd unit。"))
+    install.add_argument("--scope", choices=("user", "system"), default="user")
+    install.add_argument("--enable-now", action="store_true")
+    install.add_argument("--user", default=current_username(), help=t("Target user for system scope units. Defaults to current user.", "system 级 unit 的目标用户，默认当前用户。"))
+
+    service_print = service_sub.add_parser("print", help=t("Print a systemd unit to stdout.", "把 systemd unit 打印到标准输出。"))
+    service_print.add_argument("--scope", choices=("user", "system"), default="user")
+    service_print.add_argument("--user", default=current_username(), help=t("Target user for system scope units. Defaults to current user.", "system 级 unit 的目标用户，默认当前用户。"))
+
+    uninstall = service_sub.add_parser("uninstall", help=t("Remove an installed systemd unit.", "移除已安装的 systemd unit。"))
+    uninstall.add_argument("--scope", choices=("user", "system"), default="user")
+    uninstall.add_argument("--disable-now", action="store_true")
+
+
+def _add_use_parser(sub) -> None:
+    spec = command_spec("use")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("app", choices=APP_CHOICES)
+    parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
+
+
+def _add_proxy_parser(sub) -> None:
+    spec = command_spec("proxy")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    proxy_sub = parser.add_subparsers(dest="proxy_command", required=True)
+
+    up = proxy_sub.add_parser("up", help=t("Start proxy in background.", "后台启动代理。"))
+    up.add_argument("--host", help=t("Override listen host.", "覆盖监听 host。"))
+    up.add_argument("--port", type=int, help=t("Override listen port.", "覆盖监听端口。"))
+
+    run = proxy_sub.add_parser("run", help=t("Run proxy in foreground.", "以前台方式运行代理。"))
+    run.add_argument("--host", help=t("Override listen host.", "覆盖监听 host。"))
+    run.add_argument("--port", type=int, help=t("Override listen port.", "覆盖监听端口。"))
+
+    config_parser = proxy_sub.add_parser("config", help=t("Show or update persistent proxy settings.", "显示或更新持久化代理配置。"))
+    config_sub = config_parser.add_subparsers(dest="proxy_config_command", required=True)
+    config_sub.add_parser("show", help=t("Show persistent proxy settings.", "显示持久化代理配置。"))
+    config_set = config_sub.add_parser("set", help=t("Update persistent proxy settings.", "更新持久化代理配置。"))
+    config_set.add_argument("--host", help=t("Persist a new listen host.", "持久化新的监听 host。"))
+    config_set.add_argument("--port", type=int, help=t("Persist a new listen port.", "持久化新的监听端口。"))
+    config_set.add_argument("--auto-failover", choices=("on", "off"), help=t("Enable or disable automatic failover.", "开启或关闭自动故障转移。"))
+    config_set.add_argument("--cooldown-sec", type=int, help=t("Cooldown applied to a failed provider before it is tried again.", "失败 provider 在再次尝试前的冷却秒数。"))
+    config_set.add_argument("--failure-threshold", type=int, help=t("How many failed requests before a provider enters cooldown.", "连续多少次请求失败后才进入冷却。"))
+    config_set.add_argument("--retry-attempts", type=int, help=t("How many attempts to make on the same provider before failover.", "同一个 provider 在故障转移前最多重试多少次。"))
+    config_set.add_argument("--max-body-mb", type=int, help=t("Maximum accepted request body size in MiB.", "允许的最大请求体大小，单位 MiB。"))
+
+    proxy_sub.add_parser("down", help=t("Stop background proxy.", "停止后台代理。"))
+    proxy_sub.add_parser("status", help=t("Show proxy status.", "显示代理状态。"))
+    proxy_sub.add_parser("logs", help=t("Show recent proxy logs.", "显示最近的代理日志。"))
+
+
+def _add_codex_parser(sub) -> None:
+    spec = command_spec("codex")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("--provider", help=t("Optional provider selector to switch first.", "可选：先切 provider 再启动。"))
+    parser.add_argument("args", nargs=argparse.REMAINDER, help=t("Arguments forwarded to codex.", "透传给 codex 的参数。"))
+
+
+def _add_claude_parser(sub) -> None:
+    spec = command_spec("claude")
+    parser = sub.add_parser(spec.name, help=t(spec.help_en, spec.help_zh))
+    parser.add_argument("--provider", help=t("Optional provider selector to switch first.", "可选：先切 provider 再启动。"))
+    parser.add_argument("args", nargs=argparse.REMAINDER, help=t("Arguments forwarded to claude.", "透传给 claude 的参数。"))
+
+
+def _add_completion_parser(sub) -> None:
+    parser = sub.add_parser(command_spec("completion").name, help=argparse.SUPPRESS)
+    parser.add_argument("shell", choices=("bash", "zsh", "fish"))
+
+
+def _add_complete_providers_parser(sub) -> None:
+    parser = sub.add_parser(command_spec("_complete-providers").name, help=argparse.SUPPRESS)
+    parser.add_argument("app", choices=APP_CHOICES)
+
+
+def _add_internal_proxy_parser(sub) -> None:
+    parser = sub.add_parser(command_spec("_proxy-run").name)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", required=True, type=int)
+
+
+COMMAND_BUILDERS = {
+    "init": _add_init_parser,
+    "import-cc-switch": _add_import_parser,
+    "add": _add_add_parser,
+    "list": _add_list_parser,
+    "current": _add_current_parser,
+    "show": _add_show_parser,
+    "update": _add_update_parser,
+    "delete": _add_delete_parser,
+    "check": _add_check_parser,
+    "test": _add_test_parser,
+    "next": _add_next_parser,
+    "health": _add_health_parser,
+    "service": _add_service_parser,
+    "use": _add_use_parser,
+    "proxy": _add_proxy_parser,
+    "codex": _add_codex_parser,
+    "claude": _add_claude_parser,
+    "completion": _add_completion_parser,
+    "_complete-providers": _add_complete_providers_parser,
+    "_proxy-run": _add_internal_proxy_parser,
+}
+
+
 def build_parser(lang: str = "en") -> argparse.ArgumentParser:
     global CLI_LANG
     CLI_LANG = lang
@@ -147,482 +335,33 @@ def build_parser(lang: str = "en") -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--json",
+        dest="dashboard_json",
+        action="store_true",
+        help=t("Print top-level dashboard snapshot as JSON.", "以 JSON 输出顶层 dashboard 摘要。"),
+    )
     sub = parser.add_subparsers(
         dest="command",
-        required=True,
-        metavar="{" + ",".join(PUBLIC_COMMANDS) + "}",
+        required=False,
+        metavar="{" + ",".join(visible_command_names()) + "}",
     )
-
-    sub.add_parser("init", help=t("Create config skeleton if missing.", "初始化配置骨架。"))
-
-    import_parser = sub.add_parser(
-        "import-cc-switch",
-        help=t("Import codex/claude providers from ~/.cc-switch/cc-switch.db.", "从 ~/.cc-switch/cc-switch.db 导入 codex/claude provider。"),
-    )
-    import_parser.add_argument(
-        "--db-path",
-        default=str(Path.home() / ".cc-switch" / "cc-switch.db"),
-        help=t("Path to cc-switch.db.", "cc-switch.db 路径。"),
-    )
-
-    add_parser = sub.add_parser("add", help=t("Add a provider manually.", "手动添加 provider。"))
-    add_parser.add_argument("app", choices=APP_CHOICES)
-    add_parser.add_argument("id", help=t("Provider ID used inside ccproxy.", "ccproxy 内部使用的 provider ID。"))
-    add_parser.add_argument("--name", help=t("Human-readable provider name.", "便于识别的 provider 名称。"))
-    add_parser.add_argument("--base-url", required=True, help=t("Upstream base URL.", "上游 base URL。"))
-    add_parser.add_argument("--api-key", required=True, help=t("Upstream API key.", "上游 API key。"))
-    add_parser.add_argument("--model", help=t("Default model for Codex launcher.", "Codex 启动时默认模型。"))
-    add_parser.add_argument(
-        "--auth-mode",
-        choices=("bearer", "x-api-key", "both"),
-        help=t("Auth mode for Claude upstreams. Defaults to bearer for codex and claude.", "Claude 上游的鉴权模式；codex/claude 默认都是 bearer。"),
-    )
-    add_parser.add_argument(
-        "--set-current",
-        action="store_true",
-        help=t("Set this provider as current immediately.", "添加后立刻设为当前 provider。"),
-    )
-    add_parser.add_argument(
-        "--priority",
-        type=int,
-        help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"),
-    )
-
-    list_parser = sub.add_parser("list", help=t("List providers for an app.", "列出某个 app 的 provider。"))
-    list_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
-
-    current_parser = sub.add_parser("current", help=t("Show current provider.", "显示当前 provider。"))
-    current_parser.add_argument("app", nargs="?", default="codex", choices=APP_CHOICES)
-
-    show_parser = sub.add_parser("show", help=t("Show a provider config.", "显示单个 provider 配置。"))
-    show_parser.add_argument("app", choices=APP_CHOICES)
-    show_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
-
-    update_parser = sub.add_parser("update", help=t("Update a provider config.", "更新 provider 配置。"))
-    update_parser.add_argument("app", choices=APP_CHOICES)
-    update_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
-    update_parser.add_argument("--name", help=t("Human-readable provider name.", "便于识别的 provider 名称。"))
-    update_parser.add_argument("--base-url", help=t("Upstream base URL.", "上游 base URL。"))
-    update_parser.add_argument("--api-key", help=t("Upstream API key.", "上游 API key。"))
-    update_parser.add_argument("--model", help=t("Default model for Codex launcher.", "Codex 启动时默认模型。"))
-    update_parser.add_argument(
-        "--auth-mode",
-        choices=("bearer", "x-api-key", "both"),
-        help=t("Auth mode for Claude upstreams.", "Claude 上游的鉴权模式。"),
-    )
-    update_parser.add_argument(
-        "--priority",
-        type=int,
-        help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"),
-    )
-    update_parser.add_argument(
-        "--set-current",
-        action="store_true",
-        help=t("Set this provider as current immediately.", "更新后立刻设为当前 provider。"),
-    )
-
-    delete_parser = sub.add_parser("delete", help=t("Delete a provider.", "删除 provider。"))
-    delete_parser.add_argument("app", choices=APP_CHOICES)
-    delete_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
-
-    check_parser = sub.add_parser("check", help=t("Run a real non-interactive health check against a provider.", "对 provider 跑一次真实的非交互健康检查。"))
-    check_parser.add_argument("app", choices=APP_CHOICES)
-    check_parser.add_argument("provider", nargs="?", help=t("Provider ID first, then exact provider name. Defaults to current provider.", "优先传 provider ID，其次精确名称；默认检查当前 provider。"))
-    check_parser.add_argument(
-        "--timeout-sec",
-        type=float,
-        help=t(
-            f"Per-provider timeout in seconds. Defaults to {DEFAULT_CHECK_TIMEOUT_SEC:g}.",
-            f"单个 provider 检查超时秒数；默认 {DEFAULT_CHECK_TIMEOUT_SEC:g} 秒。",
-        ),
-    )
-
-    test_parser = sub.add_parser(
-        "test",
-        help=t("Batch test providers and print a readable summary.", "批量测试 provider，并输出人类可读汇总。"),
-    )
-    test_parser.add_argument("app", nargs="?", choices=APP_CHOICES)
-    test_parser.add_argument("--json", action="store_true", help=t("Print test result as JSON.", "以 JSON 输出测试结果。"))
-    test_parser.add_argument(
-        "--timeout-sec",
-        type=float,
-        help=t(
-            f"Per-provider timeout in seconds. Defaults to {DEFAULT_CHECK_TIMEOUT_SEC:g}.",
-            f"单个 provider 检查超时秒数；默认 {DEFAULT_CHECK_TIMEOUT_SEC:g} 秒。",
-        ),
-    )
-
-    next_parser = sub.add_parser(
-        "next",
-        help=t("Rotate to the next healthy provider. Failed candidates are skipped automatically.", "切到下一个健康 provider，失败候选会自动跳过。"),
-    )
-    next_parser.add_argument("app", choices=APP_CHOICES)
-
-    health_parser = sub.add_parser(
-        "health",
-        help=t("Show runtime provider health and cooldown state recorded by the proxy.", "显示代理记录的运行期健康状态和冷却状态。"),
-    )
-    health_parser.add_argument("app", nargs="?", choices=APP_CHOICES)
-    health_parser.add_argument("--json", action="store_true", help=t("Print health state as JSON.", "以 JSON 输出健康状态。"))
-
-    service_parser = sub.add_parser("service", help=t("Install or print a systemd service for boot-time startup.", "安装或打印开机自启用的 systemd 服务。"))
-    service_sub = service_parser.add_subparsers(dest="service_command", required=True)
-
-    service_install = service_sub.add_parser("install", help=t("Install a systemd unit.", "安装 systemd unit。"))
-    service_install.add_argument("--scope", choices=("user", "system"), default="user")
-    service_install.add_argument("--enable-now", action="store_true")
-    service_install.add_argument(
-        "--user",
-        default=current_username(),
-        help=t("Target user for system scope units. Defaults to current user.", "system 级 unit 的目标用户，默认当前用户。"),
-    )
-
-    service_print = service_sub.add_parser("print", help=t("Print a systemd unit to stdout.", "把 systemd unit 打印到标准输出。"))
-    service_print.add_argument("--scope", choices=("user", "system"), default="user")
-    service_print.add_argument(
-        "--user",
-        default=current_username(),
-        help=t("Target user for system scope units. Defaults to current user.", "system 级 unit 的目标用户，默认当前用户。"),
-    )
-
-    service_uninstall = service_sub.add_parser("uninstall", help=t("Remove an installed systemd unit.", "移除已安装的 systemd unit。"))
-    service_uninstall.add_argument("--scope", choices=("user", "system"), default="user")
-    service_uninstall.add_argument("--disable-now", action="store_true")
-
-    use_parser = sub.add_parser("use", help=t("Switch current provider.", "切换当前 provider。"))
-    use_parser.add_argument("app", choices=APP_CHOICES)
-    use_parser.add_argument("selector", help=t("Provider ID first, then exact provider name.", "优先传 provider ID，其次精确名称。"))
-
-    proxy_parser = sub.add_parser("proxy", help=t("Manage the local proxy.", "管理本地代理。"))
-    proxy_sub = proxy_parser.add_subparsers(dest="proxy_command", required=True)
-
-    proxy_up = proxy_sub.add_parser("up", help=t("Start proxy in background.", "后台启动代理。"))
-    proxy_up.add_argument("--host", help=t("Override listen host.", "覆盖监听 host。"))
-    proxy_up.add_argument("--port", type=int, help=t("Override listen port.", "覆盖监听端口。"))
-
-    proxy_run = proxy_sub.add_parser("run", help=t("Run proxy in foreground.", "以前台方式运行代理。"))
-    proxy_run.add_argument("--host", help=t("Override listen host.", "覆盖监听 host。"))
-    proxy_run.add_argument("--port", type=int, help=t("Override listen port.", "覆盖监听端口。"))
-
-    proxy_config_parser = proxy_sub.add_parser("config", help=t("Show or update persistent proxy settings.", "显示或更新持久化代理配置。"))
-    proxy_config_sub = proxy_config_parser.add_subparsers(dest="proxy_config_command", required=True)
-    proxy_config_sub.add_parser("show", help=t("Show persistent proxy settings.", "显示持久化代理配置。"))
-    proxy_config_set = proxy_config_sub.add_parser("set", help=t("Update persistent proxy settings.", "更新持久化代理配置。"))
-    proxy_config_set.add_argument("--host", help=t("Persist a new listen host.", "持久化新的监听 host。"))
-    proxy_config_set.add_argument("--port", type=int, help=t("Persist a new listen port.", "持久化新的监听端口。"))
-    proxy_config_set.add_argument(
-        "--auto-failover",
-        choices=("on", "off"),
-        help=t("Enable or disable automatic failover.", "开启或关闭自动故障转移。"),
-    )
-    proxy_config_set.add_argument(
-        "--cooldown-sec",
-        type=int,
-        help=t("Cooldown applied to a failed provider before it is tried again.", "失败 provider 在再次尝试前的冷却秒数。"),
-    )
-    proxy_config_set.add_argument(
-        "--failure-threshold",
-        type=int,
-        help=t("How many failed requests before a provider enters cooldown.", "连续多少次请求失败后才进入冷却。"),
-    )
-    proxy_config_set.add_argument(
-        "--retry-attempts",
-        type=int,
-        help=t("How many attempts to make on the same provider before failover.", "同一个 provider 在故障转移前最多重试多少次。"),
-    )
-    proxy_config_set.add_argument(
-        "--max-body-mb",
-        type=int,
-        help=t("Maximum accepted request body size in MiB.", "允许的最大请求体大小，单位 MiB。"),
-    )
-
-    proxy_sub.add_parser("down", help=t("Stop background proxy.", "停止后台代理。"))
-    proxy_sub.add_parser("status", help=t("Show proxy status.", "显示代理状态。"))
-    proxy_sub.add_parser("logs", help=t("Show recent proxy logs.", "显示最近的代理日志。"))
-
-    codex_parser = sub.add_parser(
-        "codex",
-        help=t("Launch Codex with a temporary CODEX_HOME pointed at localhost proxy.", "用指向 localhost 代理的临时 CODEX_HOME 启动 Codex。"),
-    )
-    codex_parser.add_argument(
-        "--provider",
-        help=t("Optional provider selector to switch first.", "可选：先切 provider 再启动。"),
-    )
-    codex_parser.add_argument("args", nargs=argparse.REMAINDER, help=t("Arguments forwarded to codex.", "透传给 codex 的参数。"))
-
-    claude_parser = sub.add_parser(
-        "claude",
-        help=t("Launch Claude with a temporary --settings file pointed at localhost proxy.", "用指向 localhost 代理的临时 --settings 启动 Claude。"),
-    )
-    claude_parser.add_argument(
-        "--provider",
-        help=t("Optional provider selector to switch first.", "可选：先切 provider 再启动。"),
-    )
-    claude_parser.add_argument("args", nargs=argparse.REMAINDER, help=t("Arguments forwarded to claude.", "透传给 claude 的参数。"))
-
-    completion_parser = sub.add_parser(
-        "completion",
-        help=argparse.SUPPRESS,
-    )
-    completion_parser.add_argument("shell", choices=("bash", "zsh", "fish"))
-
-    complete_providers = sub.add_parser("_complete-providers", help=argparse.SUPPRESS)
-    complete_providers.add_argument("app", choices=APP_CHOICES)
-
-    internal_proxy = sub.add_parser("_proxy-run")
-    internal_proxy.add_argument("--host", required=True)
-    internal_proxy.add_argument("--port", required=True, type=int)
-
-    for hidden_command in ("completion", "_complete-providers", "_proxy-run"):
+    for spec in all_command_specs():
+        COMMAND_BUILDERS[spec.name](sub)
+    for hidden_command in hidden_command_names():
         _hide_subparser(sub, hidden_command)
-
     return parser
 
 
-def print_provider_list(app: str) -> None:
-    data = load_config()
-    app = normalize_app(app)
-    current = data["apps"][app]["current"]
-    ordered = ordered_provider_items(data, app)
-    if not ordered:
-        print(t(f"[{app}] no providers configured", f"[{app}] 没有配置 provider"))
-        return
-
-    print(t(f"[{app}] providers", f"[{app}] provider 列表"))
-    for provider_id, provider in ordered:
-        marker = "*" if provider_id == current else " "
-        name = provider.get("name", provider_id)
-        base_url = provider.get("base_url", "")
-        priority = provider_priority(provider)
-        print(f"{marker} p={priority:<4} {provider_id:24} {name:24} {base_url}")
-
-
-def print_current(app: str) -> None:
-    data = load_config()
-    provider_id, provider = current_provider(data, app)
-    priority = provider_priority(provider)
-    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
-    print(
-        t(
-            f"{app}: {provider_label} p={priority} -> {provider.get('base_url')}",
-            f"{app}: {provider_label} p={priority} -> {provider.get('base_url')}",
-        )
-    )
-
-
-def cmd_show(app: str, selector: str) -> int:
-    data = load_config()
-    provider_id, provider = resolve_provider_selector(data["apps"][app]["providers"], selector)
-    print(
-        json.dumps(
-            {
-                "app": app,
-                "provider_id": provider_id,
-                "current": provider_id == current_provider_id(data, app),
-                "provider": provider,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-def cmd_import_cc_switch(db_path: Path) -> int:
-    data = load_config()
-    stats = import_from_cc_switch(data, db_path)
-    save_config(data)
-    print(
-        t(
-            "imported "
-            f"codex={stats['codex_imported']} "
-            f"claude={stats['claude_imported']} "
-            f"skipped-codex={stats['codex_skipped']} "
-            f"skipped-claude={stats['claude_skipped']}",
-            "已导入 "
-            f"codex={stats['codex_imported']} "
-            f"claude={stats['claude_imported']} "
-            f"跳过-codex={stats['codex_skipped']} "
-            f"跳过-claude={stats['claude_skipped']}",
-        )
-    )
-    return 0
-
-
-def cmd_add(args: argparse.Namespace) -> int:
-    data = load_config()
-    provider = {
-        "name": args.name or args.id,
-        "base_url": args.base_url,
-        "api_key": args.api_key,
-        "model": args.model,
-        "auth_mode": args.auth_mode or "bearer",
-        "priority": args.priority if args.priority is not None else DEFAULT_PROVIDER_PRIORITY,
-    }
-    upsert_provider(
-        data,
-        args.app,
-        args.id,
-        provider,
-        set_current=args.set_current,
-    )
-    save_config(data)
-    provider_label = format_provider_label(args.id, provider.get("name", args.id))
-    print(t(f"saved {args.app} provider: {provider_label}", f"已保存 {args.app} provider: {provider_label}"))
-    if args.set_current:
-        print(t(f"current {args.app}: {provider_label}", f"当前 {args.app}: {provider_label}"))
-    return 0
-
-
-def cmd_update(args: argparse.Namespace) -> int:
-    data = load_config()
-    provider_id, provider = resolve_provider_selector(data["apps"][args.app]["providers"], args.selector)
-    changed: dict[str, object] = {}
-
-    for key, value in (
-        ("name", args.name),
-        ("base_url", args.base_url),
-        ("api_key", args.api_key),
-        ("model", args.model),
-        ("auth_mode", args.auth_mode),
-        ("priority", args.priority),
-    ):
-        if value is None:
-            continue
-        if provider.get(key) != value:
-            provider[key] = value
-            changed[key] = value
-
-    if args.set_current and current_provider_id(data, args.app) != provider_id:
-        set_current_provider(data, args.app, provider_id)
-        changed["current"] = provider_id
-
-    if not changed:
-        print(t("no provider changes", "provider 配置没有变化"))
-        return 0
-
-    save_config(data)
-    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
-    print(t(f"updated {args.app} provider: {provider_label}", f"已更新 {args.app} provider: {provider_label}"))
-    for key, value in changed.items():
-        print(f"  {key} = {value}")
-    return 0
-
-
-def cmd_delete(app: str, selector: str) -> int:
-    data = load_config()
-    previous_current = current_provider_id(data, app)
-    provider_id, provider = remove_provider(data, app, selector)
-    new_current = current_provider_id(data, app)
-    save_config(data)
-    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
-    print(
-        t(
-            f"deleted {app} provider: {provider_label}",
-            f"已删除 {app} provider: {provider_label}",
-        )
-    )
-    if previous_current != new_current:
-        if new_current is None:
-            print(t(f"current {app}: none", f"当前 {app}: 无"))
-        else:
-            current_id, current = current_provider(data, app)
-            current_label = format_provider_label(current_id, current.get("name", current_id))
-            print(
-                t(
-                    f"current {app}: {current_label}",
-                    f"当前 {app}: {current_label}",
-                )
-            )
-    return 0
-
-
-def cmd_completion(shell: str) -> int:
-    print(render_completion(shell), end="")
-    return 0
-
-
-def cmd_complete_providers(app: str) -> int:
-    for provider_id, description in completion_provider_entries(app):
-        print(f"{provider_id}\t{description}")
-    return 0
-
-
-def cmd_use(app: str, selector: str) -> int:
-    data = load_config()
-    provider_id, provider = set_current_provider(data, app, selector)
-    save_config(data)
-    status = proxy_runtime_status(data)
-    provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
-    print(t(f"current {app}: {provider_label}", f"当前 {app}: {provider_label}"))
-    if status["running"]:
-        print(
-            t(
-                "proxy is running, next request will use the new provider without restarting the client",
-                "代理正在运行，下一次请求会直接使用新的 provider，不需要重启前台客户端",
-            )
-        )
-    return 0
-
-
-def cmd_check(app: str, provider: str | None, timeout_sec: float | None = None) -> int:
-    result = run_check(app, provider, timeout_sec=timeout_sec)
-    status = t("OK", "成功") if result.success else t("FAIL", "失败")
-    provider_label = format_provider_label(result.provider_id, result.provider_name)
-    print(
-        f"[{status}] {result.app} {provider_label} "
-        f"{result.duration_sec:.1f}s"
-    )
-    if not result.success:
-        if result.stderr.strip():
-            print(result.stderr.strip())
-        elif result.stdout.strip():
-            print(result.stdout.strip())
-        return 1
-    return 0
+def format_provider_label(provider_id: str, provider_name: str | None) -> str:
+    return _format_provider_label(provider_id, provider_name)
 
 
 def _check_detail(result) -> str | None:
-    error_lines: list[str] = []
-    info_lines: list[str] = []
-
-    for text in (result.stderr, result.stdout):
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped in CHECK_DETAIL_NOISE_LINES:
-                continue
-            if stripped.startswith(CHECK_DETAIL_NOISE_PREFIXES):
-                continue
-            try:
-                payload = json.loads(stripped)
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, dict):
-                parsed = payload.get("result")
-                if isinstance(parsed, str):
-                    stripped = parsed.strip()
-                else:
-                    stripped = ""
-                if not stripped or stripped in CHECK_DETAIL_NOISE_LINES:
-                    continue
-            if stripped.startswith("ERROR:"):
-                error_lines.append(stripped)
-                continue
-            info_lines.append(stripped)
-    if error_lines:
-        return error_lines[-1]
-    if result.success:
-        return None
-    if info_lines:
-        return info_lines[0]
-    return None
+    return check_detail(result)
 
 
-def format_provider_label(provider_id: str, provider_name: str | None) -> str:
-    name = (provider_name or provider_id).strip() or provider_id
-    if name == provider_id:
-        return provider_id
-    return f"{name} ({provider_id})"
+run_check = run_check_action
 
 
 def _build_test_row(
@@ -656,12 +395,160 @@ def _iter_test_rows(
         yield _build_test_row(provider_id, provider, current, result)
 
 
-def _update_test_summary(summary: dict[str, int], row: dict[str, object]) -> None:
-    summary["total"] += 1
-    if row["success"]:
-        summary["ok"] += 1
-    else:
-        summary["fail"] += 1
+def build_test_snapshot(app: str | None = None, timeout_sec: float | None = None) -> dict[str, object]:
+    data = load_config()
+    apps = [normalize_app(app)] if app else list(APP_CHOICES)
+    snapshot: dict[str, object] = {"apps": {}, "summary": {"ok": 0, "fail": 0, "total": 0}}
+    summary = snapshot["summary"]
+
+    for app_name in apps:
+        ordered = ordered_provider_items(data, app_name)
+        current = current_provider_id(data, app_name)
+        rows = list(_iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec))
+        snapshot["apps"][app_name] = rows
+        for row in rows:
+            update_test_summary(summary, row)
+
+    return snapshot
+
+
+def build_health_snapshot(app: str | None = None) -> dict[str, object]:
+    return _build_health_snapshot(app)
+
+
+def print_provider_list(app: str) -> None:
+    rows = build_provider_rows(app)
+    if not rows:
+        print(t(f"[{app}] no providers configured", f"[{app}] 没有配置 provider"))
+        return
+    print(t(f"[{app}] providers", f"[{app}] provider 列表"))
+    for row in rows:
+        marker = "*" if row["current"] else " "
+        print(f"{marker} p={row['priority']:<4} {row['provider_id']:24} {row['provider_name']:24} {row['base_url']}")
+
+
+def print_current(app: str) -> None:
+    summary = build_current_provider_summary(app)
+    print(t(
+        f"{app}: {summary['label']} p={summary['priority']} -> {summary['base_url']}",
+        f"{app}: {summary['label']} p={summary['priority']} -> {summary['base_url']}",
+    ))
+
+
+def cmd_show(app: str, selector: str) -> int:
+    data = load_config()
+    providers = data["apps"][app]["providers"]
+    from ccproxy.config import current_provider_id, resolve_provider_selector
+
+    provider_id, provider = resolve_provider_selector(providers, selector)
+    print(json.dumps({"app": app, "provider_id": provider_id, "current": provider_id == current_provider_id(data, app), "provider": provider}, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_import_cc_switch(db_path: Path) -> int:
+    data = load_config()
+    stats = import_from_cc_switch(data, db_path)
+    from ccproxy.config import save_config
+
+    save_config(data)
+    print(t(
+        "imported "
+        f"codex={stats['codex_imported']} "
+        f"claude={stats['claude_imported']} "
+        f"skipped-codex={stats['codex_skipped']} "
+        f"skipped-claude={stats['claude_skipped']}",
+        "已导入 "
+        f"codex={stats['codex_imported']} "
+        f"claude={stats['claude_imported']} "
+        f"跳过-codex={stats['codex_skipped']} "
+        f"跳过-claude={stats['claude_skipped']}",
+    ))
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    result = add_provider_action(
+        args.app,
+        args.id,
+        name=args.name,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
+        auth_mode=args.auth_mode,
+        set_current=args.set_current,
+        priority=args.priority,
+    )
+    print(t(f"saved {args.app} provider: {result['provider_label']}", f"已保存 {args.app} provider: {result['provider_label']}"))
+    if args.set_current:
+        print(t(f"current {args.app}: {result['provider_label']}", f"当前 {args.app}: {result['provider_label']}"))
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    result = update_provider_action(
+        args.app,
+        args.selector,
+        name=args.name,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
+        auth_mode=args.auth_mode,
+        priority=args.priority,
+        set_current=args.set_current,
+    )
+    if not result["changed"]:
+        print(t("no provider changes", "provider 配置没有变化"))
+        return 0
+    print(t(f"updated {args.app} provider: {result['provider_label']}", f"已更新 {args.app} provider: {result['provider_label']}"))
+    for key, value in result["changed"].items():
+        print(f"  {key} = {value}")
+    return 0
+
+
+def cmd_delete(app: str, selector: str) -> int:
+    result = delete_provider_action(app, selector)
+    print(t(f"deleted {app} provider: {result['provider_label']}", f"已删除 {app} provider: {result['provider_label']}"))
+    if result["previous_current"] != result["new_current"]:
+        if result["new_current"] is None:
+            print(t(f"current {app}: none", f"当前 {app}: 无"))
+        else:
+            current_id, current = result["new_current_provider"]
+            current_label = format_provider_label(current_id, current.get("name", current_id))
+            print(t(f"current {app}: {current_label}", f"当前 {app}: {current_label}"))
+    return 0
+
+
+def cmd_completion(shell: str) -> int:
+    print(render_completion(shell), end="")
+    return 0
+
+
+def cmd_complete_providers(app: str) -> int:
+    for provider_id, description in completion_provider_entries(app):
+        print(f"{provider_id}\t{description}")
+    return 0
+
+
+def cmd_use(app: str, selector: str) -> int:
+    result = use_provider_action(app, selector)
+    print(t(f"current {app}: {result['provider_label']}", f"当前 {app}: {result['provider_label']}"))
+    if result["proxy_status"]["running"]:
+        print(t("proxy is running, next request will use the new provider without restarting the client", "代理正在运行，下一次请求会直接使用新的 provider，不需要重启前台客户端"))
+    return 0
+
+
+def cmd_check(app: str, provider: str | None, timeout_sec: float | None = None) -> int:
+    result = run_check_action(app, provider, timeout_sec=timeout_sec)
+    status = t("OK", "成功") if result.success else t("FAIL", "失败")
+    provider_label = format_provider_label(result.provider_id, result.provider_name)
+    print(f"[{status}] {result.app} {provider_label} {result.duration_sec:.1f}s")
+    if not result.success:
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        elif result.stdout.strip():
+            print(result.stdout.strip())
+        return 1
+    return 0
 
 
 def _print_test_row(row: dict[str, object]) -> None:
@@ -675,23 +562,6 @@ def _print_test_row(row: dict[str, object]) -> None:
     )
     if row["detail"]:
         print(f"  {row['detail']}", flush=True)
-
-
-def build_test_snapshot(app: str | None = None, timeout_sec: float | None = None) -> dict[str, object]:
-    data = load_config()
-    apps = [normalize_app(app)] if app else list(APP_CHOICES)
-    snapshot: dict[str, object] = {"apps": {}, "summary": {"ok": 0, "fail": 0, "total": 0}}
-    summary = snapshot["summary"]
-
-    for app_name in apps:
-        ordered = ordered_provider_items(data, app_name)
-        current = current_provider_id(data, app_name)
-        rows = list(_iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec))
-        snapshot["apps"][app_name] = rows
-        for row in rows:
-            _update_test_summary(summary, row)
-
-    return snapshot
 
 
 def cmd_test(app: str | None, json_mode: bool, timeout_sec: float | None = None) -> int:
@@ -710,56 +580,27 @@ def cmd_test(app: str | None, json_mode: bool, timeout_sec: float | None = None)
         if not ordered:
             print(t("  no providers configured", "  没有配置 provider"), flush=True)
             continue
-
         current = current_provider_id(data, app_name)
         for row in _iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec):
             _print_test_row(row)
-            _update_test_summary(summary, row)
+            update_test_summary(summary, row)
 
-    print(
-        t(
-            f"summary: ok={summary['ok']} fail={summary['fail']} total={summary['total']}",
-            f"汇总: 成功={summary['ok']} 失败={summary['fail']} 总计={summary['total']}",
-        ),
-        flush=True,
-    )
+    print(t(f"summary: ok={summary['ok']} fail={summary['fail']} total={summary['total']}", f"汇总: 成功={summary['ok']} 失败={summary['fail']} 总计={summary['total']}"), flush=True)
     return 0 if summary["fail"] == 0 else 1
 
 
-def cmd_next(app: str) -> int:
-    data = load_config()
-    candidates = next_provider_candidates(data, app)
-    if not candidates:
-        raise ValueError(f"no providers configured for {app}")
-
-    current = current_provider_id(data, app)
-    for provider_id, provider in candidates:
-        if provider_id == current and len(candidates) > 1:
-            continue
-        result = run_check(app, provider_id)
-        status = t("OK", "成功") if result.success else t("FAIL", "失败")
-        provider_label = format_provider_label(provider_id, provider.get("name", provider_id))
-        print(
-            f"[{status}] {app} {provider_label} "
-            f"{result.duration_sec:.1f}s"
-        )
-        if result.success:
-            _, selected = set_current_provider(data, app, provider_id)
-            save_config(data)
-            selected_label = format_provider_label(provider_id, selected.get("name", provider_id))
-            print(t(f"current {app}: {selected_label}", f"当前 {app}: {selected_label}"))
-            proxy_status = proxy_runtime_status(data)
-            if proxy_status["running"]:
-                print(
-                    t(
-                        "proxy is running, next request will use the new provider without restarting the client",
-                        "代理正在运行，下一次请求会直接使用新的 provider，不需要重启前台客户端",
-                    )
-                )
-            return 0
-
-    print(t(f"no healthy provider found for {app}", f"{app} 没有找到健康 provider"))
-    return 1
+def cmd_next(app: str, timeout_sec: float | None = None) -> int:
+    result = next_provider_action(app, timeout_sec=timeout_sec)
+    for attempt in result["attempts"]:
+        status = t("OK", "成功") if attempt["result"].success else t("FAIL", "失败")
+        print(f"[{status}] {app} {attempt['provider_label']} {attempt['result'].duration_sec:.1f}s")
+    if result["selected_provider_id"] is None:
+        print(t(f"no healthy provider found for {app}", f"{app} 没有找到健康 provider"))
+        return 1
+    print(t(f"current {app}: {result['selected_label']}", f"当前 {app}: {result['selected_label']}"))
+    if result["proxy_status"]["running"]:
+        print(t("proxy is running, next request will use the new provider without restarting the client", "代理正在运行，下一次请求会直接使用新的 provider，不需要重启前台客户端"))
+    return 0
 
 
 def cmd_proxy_status() -> int:
@@ -767,25 +608,10 @@ def cmd_proxy_status() -> int:
     state = t("running", "运行中") if status["running"] else t("stopped", "已停止")
     print(t(f"proxy: {state}", f"代理: {state}"))
     print(t(f"listen: http://{status['host']}:{status['port']}", f"监听地址: http://{status['host']}:{status['port']}"))
-    print(
-        t(
-            f"auto failover: {'enabled' if status['auto_failover'] else 'disabled'}",
-            f"自动故障转移: {'开启' if status['auto_failover'] else '关闭'}",
-        )
-    )
+    print(t(f"auto failover: {'enabled' if status['auto_failover'] else 'disabled'}", f"自动故障转移: {'开启' if status['auto_failover'] else '关闭'}"))
     print(t(f"cooldown sec: {status['cooldown_sec']}", f"冷却秒数: {status['cooldown_sec']}"))
-    print(
-        t(
-            f"failure threshold: {status['failure_threshold']}",
-            f"失败阈值: {status['failure_threshold']}",
-        )
-    )
-    print(
-        t(
-            f"retry attempts: {status['retry_attempts']}",
-            f"同 provider 重试次数: {status['retry_attempts']}",
-        )
-    )
+    print(t(f"failure threshold: {status['failure_threshold']}", f"失败阈值: {status['failure_threshold']}"))
+    print(t(f"retry attempts: {status['retry_attempts']}", f"同 provider 重试次数: {status['retry_attempts']}"))
     print(t(f"max body mb: {status['max_body_mb']}", f"请求体上限 MiB: {status['max_body_mb']}"))
     if status["pid"]:
         print(f"pid: {status['pid']}")
@@ -797,52 +623,11 @@ def cmd_proxy_status() -> int:
     return 0
 
 
-def build_health_snapshot(app: str | None = None) -> dict[str, object]:
-    config = load_config()
-    state = load_health_state()
-    apps = [app] if app else list(APP_CHOICES)
-    result: dict[str, object] = {"apps": {}, "health_state_file": str(health_state_path())}
-
-    for app_name in apps:
-        current = config["apps"][app_name]["current"]
-        rows: list[dict[str, object]] = []
-        ordered = ordered_provider_items(config, app_name)
-        if not ordered:
-            result["apps"][app_name] = []
-            continue
-        for provider_id, provider in ordered:
-            entry = ensure_provider_entry(
-                state,
-                app_name,
-                provider_id,
-                provider.get("name", provider_id),
-            )
-            rows.append(
-                {
-                    "provider_id": provider_id,
-                    "provider_name": provider.get("name", provider_id),
-                    "priority": provider_priority(provider),
-                    "current": provider_id == current,
-                    "status": "cooldown" if provider_in_cooldown(entry) else "ready",
-                    "total_successes": entry["total_successes"],
-                    "total_failures": entry["total_failures"],
-                    "consecutive_failures": entry["consecutive_failures"],
-                    "last_success_at": format_timestamp(entry.get("last_success_at")),
-                    "last_failure_at": format_timestamp(entry.get("last_failure_at")),
-                    "cooldown_until": format_timestamp(entry.get("cooldown_until")),
-                    "last_error": entry.get("last_error"),
-                }
-            )
-        result["apps"][app_name] = rows
-    return result
-
-
 def cmd_health(app: str | None, json_mode: bool) -> int:
     snapshot = build_health_snapshot(app)
     if json_mode:
         print(json.dumps(snapshot, indent=2, sort_keys=True))
         return 0
-
     for app_name, rows in snapshot["apps"].items():
         print(f"[{app_name}]")
         if not rows:
@@ -850,17 +635,8 @@ def cmd_health(app: str | None, json_mode: bool) -> int:
             continue
         for row in rows:
             marker = "*" if row["current"] else " "
-            print(
-                f"{marker} p={row['priority']:<4} {row['provider_id']:24} {row['provider_name']:24} "
-                f"{row['status']:8} "
-                f"succ={row['total_successes']} fail={row['total_failures']} "
-                f"cfail={row['consecutive_failures']}"
-            )
-            print(
-                f"  last_ok={row['last_success_at']} "
-                f"last_fail={row['last_failure_at']} "
-                f"cooldown_until={row['cooldown_until']}"
-            )
+            print(f"{marker} p={row['priority']:<4} {row['provider_id']:24} {row['provider_name']:24} {row['status']:8} succ={row['total_successes']} fail={row['total_failures']} cfail={row['consecutive_failures']}")
+            print(f"  last_ok={row['last_success_at']} last_fail={row['last_failure_at']} cooldown_until={row['cooldown_until']}")
             if row["last_error"]:
                 print(f"  last_error={row['last_error']}")
     print(t(f"health state file: {snapshot['health_state_file']}", f"健康状态文件: {snapshot['health_state_file']}"))
@@ -898,23 +674,12 @@ def cmd_proxy_logs() -> int:
 
 
 def cmd_proxy_config_show() -> int:
-    data = load_config()
-    print(json.dumps(proxy_config(data), indent=2, sort_keys=True))
+    print(json.dumps(proxy_config(load_config()), indent=2, sort_keys=True))
     return 0
 
 
-def cmd_proxy_config_set(
-    host: str | None,
-    port: int | None,
-    auto_failover: str | None,
-    cooldown_sec: int | None,
-    failure_threshold: int | None,
-    retry_attempts: int | None,
-    max_body_mb: int | None,
-) -> int:
-    data = load_config()
-    changed = update_proxy_config(
-        data,
+def cmd_proxy_config_set(host: str | None, port: int | None, auto_failover: str | None, cooldown_sec: int | None, failure_threshold: int | None, retry_attempts: int | None, max_body_mb: int | None) -> int:
+    result = proxy_config_set_action(
         host=host,
         port=port,
         auto_failover=(auto_failover == "on") if auto_failover is not None else None,
@@ -923,23 +688,16 @@ def cmd_proxy_config_set(
         retry_attempts=retry_attempts,
         max_body_mb=max_body_mb,
     )
-    save_config(data)
+    changed = result["changed"]
     if not changed:
         print(t("no proxy config changes", "代理配置没有变化"))
         return 0
-
     print(t("updated proxy config:", "已更新代理配置:"))
     for key, value in changed.items():
         print(f"  {key} = {value}")
-
-    runtime = proxy_runtime_status(data)
+    runtime = result["runtime"]
     if runtime["running"] and any(key in changed for key in ("host", "port", "max_body_mb")):
-        print(
-            t(
-                "proxy is running; host/port/max_body_mb changes apply after restart",
-                "代理正在运行；host/port/max_body_mb 变更会在重启后生效",
-            )
-        )
+        print(t("proxy is running; host/port/max_body_mb changes apply after restart", "代理正在运行；host/port/max_body_mb 变更会在重启后生效"))
     return 0
 
 
@@ -949,20 +707,48 @@ def cmd_proxy_run(host: str | None, port: int | None) -> int:
         data["proxy"]["host"] = host
     if port:
         data["proxy"]["port"] = port
-    save_config(data)
+    from ccproxy.config import save_config
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logging.info(
-        "starting proxy with max_body_mb=%s (%s bytes)",
-        data["proxy"].get("max_body_mb", 64),
-        proxy_max_body_bytes(data),
-    )
+    save_config(data)
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    logging.info("starting proxy with max_body_mb=%s (%s bytes)", data["proxy"].get("max_body_mb", 64), proxy_max_body_bytes(data))
     asyncio.run(run_proxy(data["proxy"]["host"], data["proxy"]["port"]))
     return 0
+
+
+def cmd_dashboard_json() -> int:
+    print(json.dumps(build_dashboard_snapshot(), indent=2, sort_keys=True))
+    return 0
+
+
+def can_launch_default_tui(stdin, stdout, env: dict[str, str] | None = None) -> bool:
+    env = env or os.environ
+    term = (env.get("TERM") or "").strip().lower()
+    if term in {"", "dumb"}:
+        return False
+    return bool(getattr(stdin, "isatty", lambda: False)() and getattr(stdout, "isatty", lambda: False)())
+
+
+def classify_invocation(args: argparse.Namespace, stdin, stdout, env: dict[str, str] | None = None) -> str:
+    if getattr(args, "command", None):
+        return "command"
+    if getattr(args, "dashboard_json", False):
+        return "dashboard-json"
+    if can_launch_default_tui(stdin, stdout, env=env):
+        return "tui"
+    return "fallback"
+
+
+def cmd_bare_non_tty_fallback(stderr: TextIO | None = None) -> int:
+    stream = stderr or sys.stderr
+    print(
+        t(
+            "ccproxy: interactive TUI requires a real terminal. Use --help, --json, or an explicit subcommand.",
+            "ccproxy：交互式 TUI 需要真实终端。请使用 --help、--json 或明确的子命令。",
+        ),
+        file=stream,
+    )
+    return BARE_NON_TTY_EXIT_CODE
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -971,46 +757,45 @@ def main(argv: list[str] | None = None) -> None:
     global CLI_LANG
     CLI_LANG = detect_cli_lang()
 
+    if args.command and getattr(args, "dashboard_json", False):
+        parser.error(t("top-level --json cannot be combined with subcommands", "顶层 --json 不能和子命令混用"))
+
     try:
+        route = classify_invocation(args, sys.stdin, sys.stdout)
+        if route == "dashboard-json":
+            raise SystemExit(cmd_dashboard_json())
+        if route == "tui":
+            raise SystemExit(run_tui(lang=CLI_LANG))
+        if route == "fallback":
+            raise SystemExit(cmd_bare_non_tty_fallback())
+
         if args.command == "init":
             print(init_config())
             raise SystemExit(0)
-
         if args.command == "import-cc-switch":
             raise SystemExit(cmd_import_cc_switch(Path(args.db_path).expanduser()))
-
         if args.command == "add":
             raise SystemExit(cmd_add(args))
-
         if args.command == "list":
             print_provider_list(args.app)
             raise SystemExit(0)
-
         if args.command == "current":
             print_current(args.app)
             raise SystemExit(0)
-
         if args.command == "show":
             raise SystemExit(cmd_show(args.app, args.selector))
-
         if args.command == "update":
             raise SystemExit(cmd_update(args))
-
         if args.command == "delete":
             raise SystemExit(cmd_delete(args.app, args.selector))
-
         if args.command == "check":
             raise SystemExit(cmd_check(args.app, args.provider, args.timeout_sec))
-
         if args.command == "test":
             raise SystemExit(cmd_test(args.app, args.json, args.timeout_sec))
-
         if args.command == "next":
             raise SystemExit(cmd_next(args.app))
-
         if args.command == "health":
             raise SystemExit(cmd_health(args.app, args.json))
-
         if args.command == "service":
             if args.service_command == "install":
                 raise SystemExit(cmd_service_install(args.scope, args.enable_now, args.user))
@@ -1018,63 +803,37 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit(cmd_service_print(args.scope, args.user))
             if args.service_command == "uninstall":
                 raise SystemExit(cmd_service_uninstall(args.scope, args.disable_now))
-
         if args.command == "use":
             raise SystemExit(cmd_use(args.app, args.selector))
-
         if args.command == "proxy":
             if args.proxy_command == "up":
-                status = start_proxy_background(host=args.host, port=args.port)
+                status = proxy_up_action(host=args.host, port=args.port)
                 pid_suffix = f" (pid={status['pid']})" if status["pid"] else ""
-                print(
-                    t(
-                        f"proxy running on http://{status['host']}:{status['port']}{pid_suffix}",
-                        f"代理已运行: http://{status['host']}:{status['port']}{pid_suffix}",
-                    )
-                )
+                print(t(f"proxy running on http://{status['host']}:{status['port']}{pid_suffix}", f"代理已运行: http://{status['host']}:{status['port']}{pid_suffix}"))
                 raise SystemExit(0)
             if args.proxy_command == "config":
                 if args.proxy_config_command == "show":
                     raise SystemExit(cmd_proxy_config_show())
                 if args.proxy_config_command == "set":
-                    raise SystemExit(
-                        cmd_proxy_config_set(
-                            args.host,
-                            args.port,
-                            args.auto_failover,
-                            args.cooldown_sec,
-                            args.failure_threshold,
-                            args.retry_attempts,
-                            args.max_body_mb,
-                        )
-                    )
+                    raise SystemExit(cmd_proxy_config_set(args.host, args.port, args.auto_failover, args.cooldown_sec, args.failure_threshold, args.retry_attempts, args.max_body_mb))
             if args.proxy_command == "run":
                 raise SystemExit(cmd_proxy_run(args.host, args.port))
             if args.proxy_command == "down":
-                stopped = stop_proxy_background()
-                print(
-                    t("proxy stopped", "代理已停止")
-                    if stopped
-                    else t("proxy was not running", "代理并未以前台后台模式运行，可能由 systemd 托管")
-                )
+                stopped = proxy_down_action()
+                print(t("proxy stopped", "代理已停止") if stopped else t("proxy was not running", "代理并未以前台后台模式运行，可能由 systemd 托管"))
                 raise SystemExit(0)
             if args.proxy_command == "status":
                 raise SystemExit(cmd_proxy_status())
             if args.proxy_command == "logs":
                 raise SystemExit(cmd_proxy_logs())
-
         if args.command == "codex":
             raise SystemExit(launch_codex(args.provider, args.args))
-
         if args.command == "claude":
             raise SystemExit(launch_claude(args.provider, args.args))
-
         if args.command == "completion":
             raise SystemExit(cmd_completion(args.shell))
-
         if args.command == "_complete-providers":
             raise SystemExit(cmd_complete_providers(args.app))
-
         if args.command == "_proxy-run":
             raise SystemExit(cmd_proxy_run(args.host, args.port))
 

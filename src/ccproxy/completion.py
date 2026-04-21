@@ -2,27 +2,11 @@ from __future__ import annotations
 
 from textwrap import dedent
 
+from ccproxy.command_registry import visible_command_names, visible_command_specs
 from ccproxy.config import APP_CHOICES, current_provider_id, load_config, ordered_provider_items
 
-COMMANDS = [
-    "init",
-    "import-cc-switch",
-    "add",
-    "list",
-    "current",
-    "show",
-    "update",
-    "delete",
-    "check",
-    "test",
-    "next",
-    "health",
-    "service",
-    "use",
-    "proxy",
-    "codex",
-    "claude",
-]
+COMMANDS = list(visible_command_names())
+TOP_LEVEL_FLAGS = ["--help", "--version", "--json"]
 
 
 def completion_provider_entries(app: str) -> list[tuple[str, str]]:
@@ -54,6 +38,7 @@ def render_completion(shell: str) -> str:
 
 def render_bash_completion() -> str:
     commands = " ".join(COMMANDS)
+    top_flags = " ".join(TOP_LEVEL_FLAGS)
     apps = " ".join(APP_CHOICES)
     return dedent(
         f"""
@@ -103,59 +88,63 @@ def render_bash_completion() -> str:
 
           if [[ "$cur" == -* ]]; then
             local opts=""
-            case "$cmd" in
-              import-cc-switch)
-                opts="--db-path"
-                ;;
-              add)
-                opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
-                ;;
-              update)
-                opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
-                ;;
-              check)
-                opts="--timeout-sec"
-                ;;
-              test|health)
-                opts="--json"
-                if [[ "$cmd" == "test" ]]; then
-                  opts="$opts --timeout-sec"
-                fi
-                ;;
-              service)
-                case "$subcmd" in
-                  install)
-                    opts="--scope --enable-now --user"
-                    ;;
-                  print)
-                    opts="--scope --user"
-                    ;;
-                  uninstall)
-                    opts="--scope --disable-now"
-                    ;;
-                esac
-                ;;
-              proxy)
-                case "$subcmd" in
-                  up|run)
-                    opts="--host --port"
-                    ;;
-                  config)
-                    case "$subsubcmd" in
-                      set)
-                        opts="--host --port --auto-failover --cooldown-sec --failure-threshold --retry-attempts --max-body-mb"
-                        ;;
-                    esac
-                    ;;
-                esac
-                ;;
-              codex|claude)
-                opts="--provider"
-                ;;
-              completion)
-                opts=""
-                ;;
-            esac
+            if [[ -z "$cmd" ]]; then
+              opts="{top_flags}"
+            else
+              case "$cmd" in
+                import-cc-switch)
+                  opts="--db-path"
+                  ;;
+                add)
+                  opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
+                  ;;
+                update)
+                  opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
+                  ;;
+                check)
+                  opts="--timeout-sec"
+                  ;;
+                test|health)
+                  opts="--json"
+                  if [[ "$cmd" == "test" ]]; then
+                    opts="$opts --timeout-sec"
+                  fi
+                  ;;
+                service)
+                  case "$subcmd" in
+                    install)
+                      opts="--scope --enable-now --user"
+                      ;;
+                    print)
+                      opts="--scope --user"
+                      ;;
+                    uninstall)
+                      opts="--scope --disable-now"
+                      ;;
+                  esac
+                  ;;
+                proxy)
+                  case "$subcmd" in
+                    up|run)
+                      opts="--host --port"
+                      ;;
+                    config)
+                      case "$subsubcmd" in
+                        set)
+                          opts="--host --port --auto-failover --cooldown-sec --failure-threshold --retry-attempts --max-body-mb"
+                          ;;
+                      esac
+                      ;;
+                  esac
+                  ;;
+                codex|claude)
+                  opts="--provider"
+                  ;;
+                completion)
+                  opts=""
+                  ;;
+              esac
+            fi
             COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
             return 0
           fi
@@ -209,58 +198,65 @@ def render_bash_completion() -> str:
 
 
 def render_zsh_completion() -> str:
+    zsh_descriptions = {
+        "init": "create config skeleton",
+        "import-cc-switch": "import providers from cc-switch",
+        "add": "add a provider",
+        "list": "list providers",
+        "current": "show current provider",
+        "show": "show provider config",
+        "update": "update provider config",
+        "delete": "delete a provider",
+        "check": "run provider health check",
+        "test": "batch test providers",
+        "next": "rotate to next healthy provider",
+        "health": "show runtime health",
+        "service": "manage systemd service",
+        "use": "switch current provider",
+        "proxy": "manage local proxy",
+        "codex": "launch codex through proxy",
+        "claude": "launch claude through proxy",
+    }
+    commands = "\n            ".join(
+        f"'{spec.name}:{zsh_descriptions.get(spec.name, spec.help_en.rstrip('.').lower())}'"
+        for spec in visible_command_specs()
+    )
     return dedent(
-        """
+        f"""
         #compdef ccproxy
 
-        _ccproxy_provider_ids() {
+        _ccproxy_provider_ids() {{
           local app="$1"
           local line value desc
           local -a providers
           while IFS=$'\t' read -r value desc; do
             [[ -z "$value" ]] && continue
             if [[ -n "$desc" ]]; then
-              desc="${desc//\\/\\\\}"
-              desc="${desc//:/\\:}"
-              providers+=("${value}:${desc}")
+              desc="${{desc//\\/\\\\}}"
+              desc="${{desc//:/\\:}}"
+              providers+=("${{value}}:${{desc}}")
             else
-              providers+=("${value}")
+              providers+=("${{value}}")
             fi
           done < <(ccproxy _complete-providers "$app" 2>/dev/null)
           _describe -t providers 'provider' providers
-        }
+        }}
 
-        _ccproxy_provider_ids_codex() {
+        _ccproxy_provider_ids_codex() {{
           _ccproxy_provider_ids codex
-        }
+        }}
 
-        _ccproxy_provider_ids_claude() {
+        _ccproxy_provider_ids_claude() {{
           _ccproxy_provider_ids claude
-        }
+        }}
 
-        _ccproxy() {
+        _ccproxy() {{
           local curcontext="$curcontext" state line
           typeset -A opt_args
 
           local -a commands
           commands=(
-            'init:create config skeleton'
-            'import-cc-switch:import providers from cc-switch'
-            'add:add a provider'
-            'list:list providers'
-            'current:show current provider'
-            'show:show provider config'
-            'update:update provider config'
-            'delete:delete a provider'
-            'check:run provider health check'
-            'test:batch test providers'
-            'next:rotate to next healthy provider'
-            'health:show runtime health'
-            'service:manage systemd service'
-            'use:switch current provider'
-            'proxy:manage local proxy'
-            'codex:launch codex through proxy'
-            'claude:launch claude through proxy'
+            {commands}
           )
 
           if (( CURRENT == 2 )); then
@@ -410,7 +406,7 @@ def render_zsh_completion() -> str:
               _arguments '2:shell:(bash zsh fish)'
               ;;
           esac
-        }
+        }}
 
         _ccproxy "$@"
         """
@@ -418,14 +414,16 @@ def render_zsh_completion() -> str:
 
 
 def render_fish_completion() -> str:
+    visible = " ".join(COMMANDS)
     return dedent(
-        """
+        f"""
         function __fish_ccproxy_provider_ids
             set -l app $argv[1]
             ccproxy _complete-providers $app 2>/dev/null
         end
 
-        complete -c ccproxy -f -n '__fish_use_subcommand' -a 'init import-cc-switch add list current show update delete check test next health service use proxy codex claude'
+        complete -c ccproxy -f -n '__fish_use_subcommand' -a '{visible}'
+        complete -c ccproxy -n 'not __fish_seen_subcommand_from {visible}; and string match -qr "^-" -- (commandline -ct)' -a '--help --version --json'
 
         complete -c ccproxy -n '__fish_seen_subcommand_from add list current show update delete check test next health use' -f -a 'codex claude'
 
