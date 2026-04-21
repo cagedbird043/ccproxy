@@ -121,6 +121,7 @@ ccproxy proxy config set --auto-failover off
 默认会开启自动故障转移。当前 provider 如果在请求时连接失败，或者返回 `429/5xx`，proxy 会先在同一个 provider 上重试，再按优先级尝试下一个 provider。
 `current` 不会被自动改写；它始终保留为你手动选择的主 provider。自动故障转移只影响这一次请求和运行期健康状态。
 同时 proxy 会记录每个 provider 的成功/失败次数、最后错误和冷却时间。
+如果上游失败时吐回来的是 HTML 报错页、压缩残片或带 ANSI 控制符的脏日志，ccproxy 现在会把它归一化成更短、更人类可读的 JSON 错误，而不是原样把乱码继续塞给前台 agent。
 
 `cooldown_sec` 的意思是：某个 provider 刚失败后，先把它放冷一段时间，再允许重新尝试，避免在坏节点之间来回抖动。
 

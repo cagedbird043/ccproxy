@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import signal
 import time
 from typing import Any
@@ -31,10 +33,152 @@ HOP_BY_HOP_HEADERS = {
 }
 
 FAILOVER_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+ERROR_BODY_PREVIEW_BYTES = 16 * 1024
+ERROR_DETAIL_LIMIT = 400
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def should_failover_status(status_code: int) -> bool:
     return status_code in FAILOVER_STATUS_CODES
+
+
+def _truncate_detail(text: str, limit: int = ERROR_DETAIL_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _normalize_text(text: str) -> str:
+    text = ANSI_ESCAPE_RE.sub("", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    text = "".join(ch if ch.isprintable() or ch in "\n\t " else " " for ch in text)
+    return " ".join(text.split()).strip()
+
+
+def _extract_message(value: object) -> str | None:
+    if isinstance(value, str):
+        cleaned = _normalize_text(value)
+        return cleaned or None
+
+    if isinstance(value, list):
+        for item in value:
+            message = _extract_message(item)
+            if message:
+                return message
+        return None
+
+    if isinstance(value, dict):
+        for key in (
+            "message",
+            "detail",
+            "error_description",
+            "error",
+            "result",
+            "reason",
+            "title",
+        ):
+            if key in value:
+                message = _extract_message(value[key])
+                if message:
+                    return message
+        for item in value.values():
+            message = _extract_message(item)
+            if message:
+                return message
+    return None
+
+
+def _decode_error_body(body: bytes, content_type: str) -> str | None:
+    if not body:
+        return None
+
+    decoded = body[:ERROR_BODY_PREVIEW_BYTES].decode("utf-8", errors="replace")
+    cleaned = _normalize_text(decoded)
+    if not cleaned:
+        return None
+
+    replacement_count = decoded.count("\ufffd")
+    if replacement_count and replacement_count >= max(4, len(decoded) // 12):
+        return None
+
+    if "json" in content_type or cleaned[:1] in "{[":
+        try:
+            payload = json.loads(decoded)
+        except json.JSONDecodeError:
+            payload = None
+        message = _extract_message(payload) if payload is not None else None
+        if message:
+            return _truncate_detail(message)
+
+    return _truncate_detail(cleaned)
+
+
+def summarize_upstream_error(status: int, headers: Any, body: bytes) -> str:
+    content_type = str(headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+    detail = _decode_error_body(body, content_type)
+    if detail:
+        return f"upstream status {status}: {detail}"
+    if content_type:
+        return f"upstream status {status} with unreadable {content_type} error body"
+    return f"upstream status {status} with unreadable error body"
+
+
+def build_proxy_error_payload(
+    app: str,
+    *,
+    detail: str,
+    provider_id: str | None = None,
+    upstream_status: int | None = None,
+) -> dict[str, Any]:
+    message = detail
+    if provider_id:
+        message = f"{provider_id}: {message}"
+
+    if app == "claude":
+        payload: dict[str, Any] = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message,
+            },
+        }
+        if provider_id:
+            payload["error"]["ccproxy_provider_id"] = provider_id
+        if upstream_status is not None:
+            payload["error"]["ccproxy_upstream_status"] = upstream_status
+        return payload
+
+    payload = {
+        "error": {
+            "message": message,
+            "type": "api_error",
+        }
+    }
+    if provider_id:
+        payload["error"]["ccproxy_provider_id"] = provider_id
+    if upstream_status is not None:
+        payload["error"]["ccproxy_upstream_status"] = upstream_status
+    return payload
+
+
+def proxy_error_response(
+    app: str,
+    *,
+    status: int,
+    detail: str,
+    provider_id: str | None = None,
+    upstream_status: int | None = None,
+) -> web.Response:
+    return web.json_response(
+        build_proxy_error_payload(
+            app,
+            detail=detail,
+            provider_id=provider_id,
+            upstream_status=upstream_status,
+        ),
+        status=status,
+    )
 
 
 def provider_attempt_order(
@@ -116,20 +260,36 @@ async def forward(request: web.Request) -> web.StreamResponse:
                         and retry_index + 1 < retry_attempts
                     )
                     if should_retry_same_provider:
+                        error_body = await upstream.read()
+                        error_detail = summarize_upstream_error(
+                            upstream.status,
+                            upstream.headers,
+                            error_body,
+                        )
                         logging.warning(
-                            "provider %s returned %s for %s, retrying same provider (%s/%s)",
+                            "provider %s returned %s for %s, retrying same provider (%s/%s): %s",
                             provider_id,
                             upstream.status,
                             request.path_qs,
                             retry_index + 1,
                             retry_attempts,
+                            error_detail,
                         )
-                        await upstream.read()
                         continue
 
                     provider_failed = should_failover_status(upstream.status)
+                    if not (200 <= upstream.status < 300):
+                        error_body = await upstream.read()
+                        error_detail = summarize_upstream_error(
+                            upstream.status,
+                            upstream.headers,
+                            error_body,
+                        )
+                        last_error = error_detail
+                    else:
+                        error_detail = None
+
                     if provider_failed:
-                        last_error = f"upstream status {upstream.status}"
                         await _update_health_state(
                             request,
                             lambda state: record_failure(
@@ -137,7 +297,7 @@ async def forward(request: web.Request) -> web.StreamResponse:
                                 app,
                                 provider_id,
                                 provider.get("name", provider_id),
-                                last_error or "",
+                                error_detail or last_error or "",
                                 cooldown_sec,
                                 failure_threshold,
                                 now_ts=time.time(),
@@ -146,13 +306,13 @@ async def forward(request: web.Request) -> web.StreamResponse:
                         can_failover = auto_failover and attempt_index + 1 < len(attempts)
                         if can_failover:
                             logging.warning(
-                                "provider %s returned %s for %s after %s attempts, trying next provider",
+                                "provider %s returned %s for %s after %s attempts, trying next provider: %s",
                                 provider_id,
                                 upstream.status,
                                 request.path_qs,
                                 retry_attempts,
+                                error_detail or last_error or f"upstream status {upstream.status}",
                             )
-                            await upstream.read()
                             break
 
                     if 200 <= upstream.status < 300:
@@ -166,23 +326,30 @@ async def forward(request: web.Request) -> web.StreamResponse:
                                 now_ts=time.time(),
                             ),
                         )
+                        response_headers = {
+                            key: value
+                            for key, value in upstream.headers.items()
+                            if key.lower() not in HOP_BY_HOP_HEADERS
+                        }
+                        response = web.StreamResponse(
+                            status=upstream.status,
+                            headers=response_headers,
+                        )
+                        await response.prepare(request)
+                        async for chunk in upstream.content.iter_chunked(64 * 1024):
+                            await response.write(chunk)
+                        await response.write_eof()
+                        return response
 
-                    response_headers = {
-                        key: value
-                        for key, value in upstream.headers.items()
-                        if key.lower() not in HOP_BY_HOP_HEADERS
-                    }
-                    response = web.StreamResponse(
+                    return proxy_error_response(
+                        app,
                         status=upstream.status,
-                        headers=response_headers,
+                        detail=error_detail or f"upstream status {upstream.status}",
+                        provider_id=provider_id,
+                        upstream_status=upstream.status,
                     )
-                    await response.prepare(request)
-                    async for chunk in upstream.content.iter_chunked(64 * 1024):
-                        await response.write(chunk)
-                    await response.write_eof()
-                    return response
             except (ClientError, asyncio.TimeoutError, OSError) as exc:
-                last_error = str(exc)
+                last_error = _truncate_detail(_normalize_text(str(exc))) or str(exc)
                 if retry_index + 1 < retry_attempts:
                     logging.warning(
                         "provider %s request failed for %s: %s; retrying same provider (%s/%s)",
@@ -218,11 +385,11 @@ async def forward(request: web.Request) -> web.StreamResponse:
                     )
                     break
                 return web.json_response(
-                    {
-                        "error": "upstream request failed",
-                        "provider_id": provider_id,
-                        "detail": str(exc),
-                    },
+                    build_proxy_error_payload(
+                        app,
+                        detail=f"upstream request failed: {last_error}",
+                        provider_id=provider_id,
+                    ),
                     status=502,
                 )
         else:
@@ -230,12 +397,10 @@ async def forward(request: web.Request) -> web.StreamResponse:
 
         continue
 
-    return web.json_response(
-        {
-            "error": "all providers failed",
-            "detail": last_error or "unknown upstream failure",
-        },
+    return proxy_error_response(
+        app,
         status=502,
+        detail=last_error or "unknown upstream failure",
     )
 
 

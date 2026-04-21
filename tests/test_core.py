@@ -1,3 +1,5 @@
+import asyncio
+import json
 import subprocess
 from pathlib import Path
 
@@ -28,7 +30,14 @@ from ccproxy.health_store import (
     record_success,
     reorder_providers_by_cooldown,
 )
-from ccproxy.proxy import make_app, provider_attempt_order, should_failover_status
+from ccproxy.proxy import (
+    build_proxy_error_payload,
+    forward,
+    make_app,
+    provider_attempt_order,
+    should_failover_status,
+    summarize_upstream_error,
+)
 from ccproxy.service import build_unit
 
 
@@ -241,6 +250,38 @@ def test_proxy_max_body_bytes_uses_mebibytes() -> None:
 def test_make_app_uses_configured_client_max_size() -> None:
     app = make_app(8 * 1024 * 1024)
     assert app._client_max_size == 8 * 1024 * 1024
+
+
+def test_summarize_upstream_error_extracts_clean_json_message() -> None:
+    detail = summarize_upstream_error(
+        403,
+        {"Content-Type": "application/json; charset=utf-8"},
+        b'{"error":{"message":"quota low \\u001b[31mboom\\u001b[0m"}}',
+    )
+    assert detail == "upstream status 403: quota low boom"
+
+
+def test_summarize_upstream_error_hides_unreadable_binary_body() -> None:
+    detail = summarize_upstream_error(
+        502,
+        {"Content-Type": "text/html"},
+        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x8b\x88\x8c",
+    )
+    assert detail == "upstream status 502 with unreadable text/html error body"
+
+
+def test_build_proxy_error_payload_matches_claude_shape() -> None:
+    payload = build_proxy_error_payload(
+        "claude",
+        detail="upstream status 429: quota low",
+        provider_id="backup-claude",
+        upstream_status=429,
+    )
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "api_error"
+    assert payload["error"]["message"] == "backup-claude: upstream status 429: quota low"
+    assert payload["error"]["ccproxy_provider_id"] == "backup-claude"
+    assert payload["error"]["ccproxy_upstream_status"] == 429
 
 
 def test_detect_cli_lang_prefers_locale_environment() -> None:
@@ -503,6 +544,76 @@ def test_cmd_test_text_mode_streams_rows_without_building_snapshot(monkeypatch, 
     assert "[FAIL]" in captured
     assert "ERROR: boom" in captured
     assert "summary: ok=1 fail=1 total=2" in captured
+
+
+def test_forward_normalizes_unreadable_upstream_error_for_codex(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.proxy.load_config",
+        lambda: {
+            "proxy": {
+                "auto_failover": False,
+                "cooldown_sec": 60,
+                "failure_threshold": 3,
+                "retry_attempts": 1,
+            },
+            "apps": {
+                "codex": {
+                    "current": "bad",
+                    "providers": {
+                        "bad": {"name": "Bad", "base_url": "https://example.com", "api_key": "k"},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            },
+        },
+    )
+
+    class FakeContent:
+        async def iter_chunked(self, _size: int):
+            if False:
+                yield b""
+
+    class FakeUpstream:
+        def __init__(self):
+            self.status = 403
+            self.headers = {"Content-Type": "text/html"}
+            self.content = FakeContent()
+
+        async def read(self):
+            return b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x8b\x88\x8c"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def request(self, *args, **kwargs):
+            return FakeUpstream()
+
+    class FakeRequest:
+        def __init__(self):
+            self.path = "/responses"
+            self.path_qs = "/responses"
+            self.query_string = ""
+            self.method = "POST"
+            self.headers = {}
+            self.app = {
+                "session": FakeSession(),
+                "health_state": default_health_state(),
+                "health_lock": asyncio.Lock(),
+            }
+
+        async def read(self):
+            return b"{}"
+
+    response = asyncio.run(forward(FakeRequest()))
+    assert response.status == 403
+    payload = json.loads(response.body.decode())
+    assert payload["error"]["type"] == "api_error"
+    assert payload["error"]["ccproxy_provider_id"] == "bad"
+    assert payload["error"]["message"] == "bad: upstream status 403 with unreadable text/html error body"
 
 
 def test_check_detail_prefers_result_field_from_json_error() -> None:
