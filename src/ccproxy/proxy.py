@@ -13,7 +13,9 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from ccproxy.adapters import ADAPTERS_BY_APP, build_upstream_url, route_request
 from ccproxy.config import load_config, ordered_provider_items, proxy_max_body_bytes
 from ccproxy.health_store import (
+    ensure_provider_entry,
     load_health_state,
+    provider_in_cooldown,
     record_failure,
     record_success,
     reorder_providers_by_cooldown,
@@ -245,6 +247,26 @@ def provider_attempt_order(
     return reorder_providers_by_cooldown(ordered, health_state, app)
 
 
+def has_ready_failover_candidate(
+    health_state: dict[str, Any],
+    app: str,
+    candidates: list[tuple[str, dict[str, Any]]],
+    *,
+    now_ts: float | None = None,
+) -> bool:
+    now_ts = now_ts or time.time()
+    for provider_id, provider in candidates:
+        entry = ensure_provider_entry(
+            health_state,
+            app,
+            provider_id,
+            provider.get("name", provider_id),
+        )
+        if not provider_in_cooldown(entry, now_ts=now_ts):
+            return True
+    return False
+
+
 async def _update_health_state(
     request: web.Request,
     updater,
@@ -360,7 +382,17 @@ async def forward(request: web.Request) -> web.StreamResponse:
                                 now_ts=time.time(),
                             ),
                         )
-                        can_failover = auto_failover and attempt_index + 1 < len(attempts)
+                        deterministic_provider_limit = quota_exhausted or payload_too_large
+                        remaining_candidates = attempts[attempt_index + 1 :]
+                        if deterministic_provider_limit:
+                            can_failover = auto_failover and has_ready_failover_candidate(
+                                request.app["health_state"],
+                                app,
+                                remaining_candidates,
+                                now_ts=time.time(),
+                            )
+                        else:
+                            can_failover = auto_failover and bool(remaining_candidates)
                         if can_failover:
                             logging.warning(
                                 "provider %s returned %s for %s after %s attempts, trying next provider: %s",

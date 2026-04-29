@@ -37,6 +37,7 @@ from ccproxy.health_store import (
 from ccproxy.proxy import (
     build_proxy_error_payload,
     forward,
+    has_ready_failover_candidate,
     is_quota_exhausted_detail,
     is_payload_too_large_detail,
     make_app,
@@ -185,6 +186,26 @@ def test_should_failover_response_treats_413_as_provider_specific_body_limit() -
         413,
         "upstream status 413 with unreadable text/html error body",
     ) is True
+
+
+def test_has_ready_failover_candidate_ignores_cooling_providers() -> None:
+    state = default_health_state()
+    record_failure(
+        state,
+        "codex",
+        "cooling",
+        "Cooling",
+        "timeout",
+        cooldown_sec=60,
+        failure_threshold=1,
+        now_ts=100.0,
+    )
+    candidates = [
+        ("cooling", {"name": "Cooling"}),
+        ("fresh", {"name": "Fresh"}),
+    ]
+    assert has_ready_failover_candidate(state, "codex", candidates, now_ts=110.0) is True
+    assert has_ready_failover_candidate(state, "codex", candidates[:1], now_ts=110.0) is False
 
 
 def test_reorder_providers_moves_cooling_provider_to_end() -> None:
@@ -1119,6 +1140,98 @@ def test_forward_payload_too_large_fails_over_without_same_provider_retries(monk
     assert response.body == b'{"ok":true}'
     assert len([url for url in seen_urls if "bad.example" in url]) == 1
     assert any("good.example" in url for url in seen_urls)
+
+
+def test_forward_payload_too_large_does_not_wait_on_only_cooling_fallbacks(monkeypatch) -> None:
+    health_state = default_health_state()
+    now_ts = time.time()
+    record_failure(
+        health_state,
+        "codex",
+        "good",
+        "CodesOnline",
+        "timeout",
+        cooldown_sec=60,
+        failure_threshold=1,
+        now_ts=now_ts,
+    )
+    monkeypatch.setattr(
+        "ccproxy.proxy.load_config",
+        lambda: {
+            "proxy": {
+                "auto_failover": True,
+                "cooldown_sec": 60,
+                "failure_threshold": 3,
+                "retry_attempts": 3,
+            },
+            "apps": {
+                "codex": {
+                    "current": "bad",
+                    "providers": {
+                        "bad": {"name": "IkunCode", "base_url": "https://bad.example", "api_key": "k"},
+                        "good": {"name": "CodesOnline", "base_url": "https://good.example", "api_key": "k"},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            },
+        },
+    )
+
+    class FakeContent:
+        async def iter_chunked(self, _size: int):
+            if False:
+                yield b""
+
+    class FakeUpstream:
+        def __init__(self, status: int, headers: dict[str, str], body: bytes):
+            self.status = status
+            self.headers = headers
+            self._body = body
+            self.content = FakeContent()
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    seen_urls: list[str] = []
+
+    class FakeSession:
+        def request(self, _method, url, **_kwargs):
+            seen_urls.append(url)
+            if "good.example" in url:
+                raise AssertionError("cooling fallback should not be tried for deterministic 413")
+            return FakeUpstream(
+                413,
+                {"Content-Type": "text/html"},
+                b"<html><body>413 Request Entity Too Large nginx/1.18.0 (Ubuntu)</body></html>",
+            )
+
+    class FakeRequest:
+        def __init__(self):
+            self.path = "/responses"
+            self.path_qs = "/responses"
+            self.query_string = ""
+            self.method = "POST"
+            self.headers = {}
+            self.app = {
+                "session": FakeSession(),
+                "health_state": health_state,
+                "health_lock": asyncio.Lock(),
+            }
+
+        async def read(self):
+            return b"{}"
+
+    response = asyncio.run(forward(FakeRequest()))
+    assert response.status == 413
+    payload = json.loads(response.body.decode())
+    assert "Request Entity Too Large" in payload["error"]["message"]
+    assert len(seen_urls) == 1
 
 
 def test_check_detail_prefers_result_field_from_json_error() -> None:
