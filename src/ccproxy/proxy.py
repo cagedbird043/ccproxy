@@ -54,6 +54,15 @@ QUOTA_EXHAUSTED_TERMS = (
     "配额不足",
     "配额已用尽",
 )
+PAYLOAD_TOO_LARGE_TERMS = (
+    "payload too large",
+    "request entity too large",
+    "content too large",
+    "body too large",
+    "client intended to send too large body",
+    "请求体过大",
+    "内容过大",
+)
 
 
 def should_failover_status(status_code: int) -> bool:
@@ -67,8 +76,23 @@ def is_quota_exhausted_detail(detail: str | None) -> bool:
     return any(term in normalized for term in QUOTA_EXHAUSTED_TERMS)
 
 
+def is_payload_too_large_detail(detail: str | None) -> bool:
+    if not detail:
+        return False
+    normalized = _normalize_text(detail).casefold()
+    return any(term in normalized for term in PAYLOAD_TOO_LARGE_TERMS)
+
+
+def is_payload_too_large_response(status_code: int, detail: str | None = None) -> bool:
+    return status_code == 413 or is_payload_too_large_detail(detail)
+
+
 def should_failover_response(status_code: int, detail: str | None = None) -> bool:
-    return should_failover_status(status_code) or is_quota_exhausted_detail(detail)
+    return (
+        should_failover_status(status_code)
+        or is_quota_exhausted_detail(detail)
+        or is_payload_too_large_response(status_code, detail)
+    )
 
 
 def _truncate_detail(text: str, limit: int = ERROR_DETAIL_LIMIT) -> str:
@@ -294,10 +318,17 @@ async def forward(request: web.Request) -> web.StreamResponse:
                         )
                         last_error = error_detail
                         quota_exhausted = is_quota_exhausted_detail(error_detail)
+                        payload_too_large = is_payload_too_large_response(
+                            upstream.status,
+                            error_detail,
+                        )
+                    else:
+                        payload_too_large = False
 
                     should_retry_same_provider = (
                         should_failover_status(upstream.status)
                         and not quota_exhausted
+                        and not payload_too_large
                         and retry_index + 1 < retry_attempts
                     )
                     if should_retry_same_provider:
@@ -315,7 +346,7 @@ async def forward(request: web.Request) -> web.StreamResponse:
                     provider_failed = should_failover_response(upstream.status, error_detail)
 
                     if provider_failed:
-                        effective_failure_threshold = 1 if quota_exhausted else failure_threshold
+                        effective_failure_threshold = 1 if (quota_exhausted or payload_too_large) else failure_threshold
                         await _update_health_state(
                             request,
                             lambda state: record_failure(

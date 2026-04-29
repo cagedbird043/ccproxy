@@ -38,6 +38,7 @@ from ccproxy.proxy import (
     build_proxy_error_payload,
     forward,
     is_quota_exhausted_detail,
+    is_payload_too_large_detail,
     make_app,
     provider_attempt_order,
     should_failover_response,
@@ -163,6 +164,27 @@ def test_should_failover_response_allows_quota_403_without_broadening_all_403() 
     assert should_failover_response(403, "upstream status 403: quota exceeded") is True
     assert should_failover_response(403, "upstream status 403: invalid api key") is False
     assert should_failover_response(429, "upstream status 429: rate limit") is True
+
+
+def test_payload_too_large_detail_detects_nginx_style_413_messages() -> None:
+    assert is_payload_too_large_detail(
+        "upstream status 413: 413 Request Entity Too Large nginx/1.18.0 (Ubuntu)"
+    ) is True
+    assert is_payload_too_large_detail(
+        "upstream status 413: Payload Too Large"
+    ) is True
+    assert is_payload_too_large_detail("upstream status 500: sensitive_words_detected") is False
+
+
+def test_should_failover_response_treats_413_as_provider_specific_body_limit() -> None:
+    assert should_failover_response(
+        413,
+        "upstream status 413: 413 Request Entity Too Large nginx/1.18.0 (Ubuntu)",
+    ) is True
+    assert should_failover_response(
+        413,
+        "upstream status 413 with unreadable text/html error body",
+    ) is True
 
 
 def test_reorder_providers_moves_cooling_provider_to_end() -> None:
@@ -993,6 +1015,110 @@ def test_forward_quota_exceeded_enters_cooldown_immediately(monkeypatch) -> None
     entry = health_state["apps"]["codex"]["bad"]
     assert entry["consecutive_failures"] == 1
     assert entry["cooldown_until"] is not None
+
+
+def test_forward_payload_too_large_fails_over_without_same_provider_retries(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.proxy.load_config",
+        lambda: {
+            "proxy": {
+                "auto_failover": True,
+                "cooldown_sec": 60,
+                "failure_threshold": 3,
+                "retry_attempts": 3,
+            },
+            "apps": {
+                "codex": {
+                    "current": "bad",
+                    "providers": {
+                        "bad": {"name": "IkunCode", "base_url": "https://bad.example", "api_key": "k"},
+                        "good": {"name": "CodesOnline", "base_url": "https://good.example", "api_key": "k"},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            },
+        },
+    )
+
+    class FakeContent:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        async def iter_chunked(self, _size: int):
+            for chunk in self._chunks:
+                yield chunk
+
+    class FakeUpstream:
+        def __init__(self, status: int, headers: dict[str, str], body: bytes = b"", chunks: list[bytes] | None = None):
+            self.status = status
+            self.headers = headers
+            self._body = body
+            self.content = FakeContent(chunks or [])
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeStreamResponse:
+        def __init__(self, *, status: int, headers: dict[str, str]):
+            self.status = status
+            self.headers = headers
+            self.body = b""
+
+        async def prepare(self, _request):
+            return self
+
+        async def write(self, chunk: bytes):
+            self.body += chunk
+
+        async def write_eof(self):
+            return None
+
+    seen_urls: list[str] = []
+
+    class FakeSession:
+        def request(self, _method, url, **_kwargs):
+            seen_urls.append(url)
+            if "bad.example" in url:
+                return FakeUpstream(
+                    413,
+                    {"Content-Type": "text/html"},
+                    b"<html><title>413 Request Entity Too Large</title><body>413 Request Entity Too Large nginx/1.18.0 (Ubuntu)</body></html>",
+                )
+            return FakeUpstream(
+                200,
+                {"Content-Type": "application/json"},
+                chunks=[b'{"ok":true}'],
+            )
+
+    class FakeRequest:
+        def __init__(self):
+            self.path = "/responses"
+            self.path_qs = "/responses"
+            self.query_string = ""
+            self.method = "POST"
+            self.headers = {}
+            self.app = {
+                "session": FakeSession(),
+                "health_state": default_health_state(),
+                "health_lock": asyncio.Lock(),
+            }
+
+        async def read(self):
+            return b"{}"
+
+    monkeypatch.setattr("ccproxy.proxy.web.StreamResponse", FakeStreamResponse)
+
+    response = asyncio.run(forward(FakeRequest()))
+    assert response.status == 200
+    assert response.body == b'{"ok":true}'
+    assert len([url for url in seen_urls if "bad.example" in url]) == 1
+    assert any("good.example" in url for url in seen_urls)
 
 
 def test_check_detail_prefers_result_field_from_json_error() -> None:
