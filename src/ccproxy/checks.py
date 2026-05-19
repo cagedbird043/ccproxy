@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ccproxy.adapters import build_upstream_url
 from ccproxy.config import (
     current_provider_id,
     load_config,
@@ -24,6 +28,9 @@ CHECK_MARKER = "CCPROXY_CHECK_OK"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CHECK_TIMEOUT_SEC = 45.0
 CHECK_TIMEOUT_RETURN_CODE = 124
+CHECK_HTTP_ERROR_RETURN_CODE = 1
+DEFAULT_CODEX_TUI_VERSION = "0.131.0"
+CODEX_CHECK_USER_AGENT_ENV = "CCPROXY_CODEX_CHECK_USER_AGENT"
 
 
 @dataclass
@@ -85,6 +92,65 @@ def _decode_subprocess_text(value: str | bytes | None) -> str:
     return value
 
 
+def _parse_codex_version(output: str) -> str | None:
+    match = re.search(r"\b(\d+\.\d+\.\d+)\b", output)
+    return match.group(1) if match else None
+
+
+def _detect_codex_version() -> str:
+    try:
+        completed = subprocess.run(
+            ["codex", "--version"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return DEFAULT_CODEX_TUI_VERSION
+    return _parse_codex_version(f"{completed.stdout}\n{completed.stderr}") or DEFAULT_CODEX_TUI_VERSION
+
+
+def _os_release_label() -> str:
+    try:
+        raw = Path("/etc/os-release").read_text()
+    except OSError:
+        return "Linux"
+
+    values: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value.strip().strip('"')
+    if values.get("ID") == "arch":
+        return "Arch Linux Rolling Release"
+    return values.get("PRETTY_NAME") or values.get("NAME") or "Linux"
+
+
+def _konsole_version_label(env: dict[str, str]) -> str | None:
+    raw = env.get("KONSOLE_VERSION")
+    if not raw or not raw.isdigit():
+        return None
+    value = int(raw)
+    major = value // 10000
+    minor = (value // 100) % 100
+    patch = value % 100
+    return f"Konsole/{major}.{minor:02d}.{patch}"
+
+
+def codex_check_user_agent(env: dict[str, str] | None = None) -> str:
+    env = env or os.environ
+    override = env.get(CODEX_CHECK_USER_AGENT_ENV)
+    if override:
+        return override
+
+    version = _detect_codex_version()
+    platform_label = f"{_os_release_label()}; {os.uname().machine}"
+    terminal_label = _konsole_version_label(env) or "Terminal"
+    return f"codex-tui/{version} ({platform_label}) {terminal_label} (codex-tui; {version})"
+
+
 def _format_timeout_sec(timeout_sec: float) -> str:
     if float(timeout_sec).is_integer():
         return str(int(timeout_sec))
@@ -141,44 +207,103 @@ def _prepare_codex_temp_home(temp_home: Path) -> None:
         _safe_link_or_copy(child, target)
 
 
-def _run_codex_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
-    model = provider.get("model") or "gpt-5.4"
-    with tempfile.TemporaryDirectory(prefix="ccproxy-codex-check-", dir=runtime_dir()) as temp_dir:
-        temp_home = Path(temp_dir)
-        _prepare_codex_temp_home(temp_home)
-        (temp_home / "config.toml").write_text(
-            "\n".join(
-                [
-                    'model_provider = "ccproxy-check"',
-                    f'model = "{model}"',
-                    "",
-                    "[model_providers.ccproxy-check]",
-                    'name = "CCProxy Check"',
-                    f'base_url = "{provider["base_url"]}"',
-                    'wire_api = "responses"',
-                    "requires_openai_auth = false",
-                    "",
-                ]
-            )
-        )
-        (temp_home / "auth.json").write_text(
-            json.dumps({"OPENAI_API_KEY": provider["api_key"]}, indent=2) + "\n"
-        )
-        env = os.environ.copy()
-        env["CODEX_HOME"] = str(temp_home)
-        return _run_subprocess(
-            [
-                "codex",
-                "exec",
-                "--skip-git-repo-check",
-                "--model",
-                model,
-                f"Reply with exactly {CHECK_MARKER}",
-            ],
-            env=env,
-            timeout_sec=timeout_sec,
-        )
+def _codex_check_headers(provider: dict[str, Any]) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {provider['api_key']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": codex_check_user_agent(),
+    }
 
+
+def _codex_check_payload(provider: dict[str, Any]) -> bytes:
+    model = provider.get("model") or "gpt-5.4"
+    return json.dumps(
+        {
+            "model": model,
+            "input": f"Reply with exactly {CHECK_MARKER}",
+            "stream": False,
+            "max_output_tokens": 16,
+        }
+    ).encode()
+
+
+def _decode_http_body(body: bytes) -> str:
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return body.decode("utf-8", errors="replace").strip()
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("detail") or error.get("type")
+            if isinstance(message, str):
+                return message.strip()
+        if isinstance(error, str):
+            return error.strip()
+    return body.decode("utf-8", errors="replace").strip()
+
+
+def _extract_responses_text(payload: object) -> str:
+    if isinstance(payload, dict):
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
+        output = payload.get("output")
+        if isinstance(output, list):
+            parts: list[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for content_item in content:
+                    if not isinstance(content_item, dict):
+                        continue
+                    text = content_item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def _run_codex_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
+    url = build_upstream_url(str(provider["base_url"]), "/v1/responses")
+    request = urllib.request.Request(
+        url,
+        data=_codex_check_payload(provider),
+        headers=_codex_check_headers(provider),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = _decode_http_body(exc.read())
+        message = f"ERROR: upstream status {exc.code} {exc.reason}"
+        if detail:
+            message = f"{message}: {detail}"
+        return CHECK_HTTP_ERROR_RETURN_CODE, "", f"{message}\n", False
+    except TimeoutError:
+        return CHECK_TIMEOUT_RETURN_CODE, "", f"ERROR: check timed out after {_format_timeout_sec(timeout_sec)}s\n", True
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, TimeoutError):
+            return CHECK_TIMEOUT_RETURN_CODE, "", f"ERROR: check timed out after {_format_timeout_sec(timeout_sec)}s\n", True
+        return CHECK_HTTP_ERROR_RETURN_CODE, "", f"ERROR: {reason}\n", False
+
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = _extract_responses_text(payload)
+    return 0, text, "", False
 
 def _run_claude_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
     with tempfile.NamedTemporaryFile(

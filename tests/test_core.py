@@ -2,10 +2,20 @@ import asyncio
 import json
 import subprocess
 import time
+import urllib.error
 from pathlib import Path
 
 from ccproxy.adapters import build_upstream_url, route_request
-from ccproxy.checks import CHECK_TIMEOUT_RETURN_CODE, CheckResult, _run_subprocess, next_provider_candidates
+from ccproxy.checks import (
+    CODEX_CHECK_USER_AGENT_ENV,
+    CHECK_HTTP_ERROR_RETURN_CODE,
+    CHECK_TIMEOUT_RETURN_CODE,
+    CheckResult,
+    codex_check_user_agent,
+    _run_codex_check,
+    _run_subprocess,
+    next_provider_candidates,
+)
 from ccproxy.command_registry import visible_command_names
 from ccproxy.completion import completion_provider_entries, completion_provider_ids, render_completion
 from ccproxy.cli import (
@@ -741,6 +751,105 @@ def test_run_subprocess_timeout_returns_human_readable_error(monkeypatch) -> Non
     assert "partial stderr" in stderr
     assert "ERROR: check timed out after 3s" in stderr
     assert timed_out is True
+
+
+def request_header(captured: dict[str, object], name: str) -> str | None:
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    for key, value in headers.items():
+        if key.casefold() == name.casefold():
+            return str(value)
+    return None
+
+
+def test_codex_check_user_agent_prefers_env_override(monkeypatch) -> None:
+    monkeypatch.setenv(CODEX_CHECK_USER_AGENT_ENV, "custom-codex-check/1")
+    assert codex_check_user_agent() == "custom-codex-check/1"
+
+
+def test_codex_check_user_agent_uses_codex_tui_shape(monkeypatch) -> None:
+    monkeypatch.delenv(CODEX_CHECK_USER_AGENT_ENV, raising=False)
+    monkeypatch.setenv("KONSOLE_VERSION", "260401")
+    monkeypatch.setattr("ccproxy.checks._detect_codex_version", lambda: "0.131.0")
+    monkeypatch.setattr("ccproxy.checks._os_release_label", lambda: "Arch Linux Rolling Release")
+
+    assert (
+        codex_check_user_agent()
+        == "codex-tui/0.131.0 (Arch Linux Rolling Release; x86_64) Konsole/26.04.1 (codex-tui; 0.131.0)"
+    )
+
+
+def test_run_codex_check_accepts_non_stream_responses_marker(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps({"output_text": "CCPROXY_CHECK_OK"}).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["body"] = json.loads(request.data.decode())
+        captured["headers"] = dict(request.header_items())
+        return FakeResponse()
+
+    monkeypatch.setattr("ccproxy.checks.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setenv(
+        CODEX_CHECK_USER_AGENT_ENV,
+        "codex-tui/0.131.0 (Arch Linux Rolling Release; x86_64) Konsole/26.04.1 (codex-tui; 0.131.0)",
+    )
+
+    returncode, stdout, stderr, timed_out = _run_codex_check(
+        {"base_url": "https://fast.poloai.top", "api_key": "sk-test", "model": "gpt-5.4"},
+        timeout_sec=7,
+    )
+
+    assert captured["url"] == "https://fast.poloai.top/v1/responses"
+    assert captured["timeout"] == 7
+    assert captured["body"]["stream"] is False
+    assert request_header(captured, "User-agent") == (
+        "codex-tui/0.131.0 (Arch Linux Rolling Release; x86_64) Konsole/26.04.1 (codex-tui; 0.131.0)"
+    )
+    assert stdout == "CCPROXY_CHECK_OK"
+    assert stderr == ""
+    assert returncode == 0
+    assert timed_out is False
+
+
+def test_run_codex_check_keeps_usage_limited_provider_failed(monkeypatch) -> None:
+    class FakeHTTPError(urllib.error.HTTPError):
+        pass
+
+    error = FakeHTTPError(
+        url="https://mx.free.codesonline.dev/v1/responses",
+        code=429,
+        msg="Too Many Requests",
+        hdrs={},
+        fp=None,
+    )
+    error.read = lambda: b'{"error":{"message":"monthly usage limit exceeded"}}'
+
+    monkeypatch.setattr(
+        "ccproxy.checks.urllib.request.urlopen",
+        lambda _request, timeout: (_ for _ in ()).throw(error),
+    )
+
+    returncode, stdout, stderr, timed_out = _run_codex_check(
+        {"base_url": "https://mx.free.codesonline.dev", "api_key": "sk-test", "model": "gpt-5.4"},
+        timeout_sec=7,
+    )
+
+    assert returncode == CHECK_HTTP_ERROR_RETURN_CODE
+    assert stdout == ""
+    assert "429 Too Many Requests" in stderr
+    assert "monthly usage limit exceeded" in stderr
+    assert timed_out is False
 
 
 def test_cmd_test_text_mode_streams_rows_without_building_snapshot(monkeypatch, capsys) -> None:
