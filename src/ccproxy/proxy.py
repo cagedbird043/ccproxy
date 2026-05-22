@@ -8,9 +8,9 @@ import signal
 import time
 from typing import Any
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
-from ccproxy.adapters import ADAPTERS_BY_APP, build_upstream_url, route_request
+from ccproxy.adapters import ADAPTERS_BY_APP, build_upstream_url, build_upstream_websocket_url, route_request
 from ccproxy.config import load_config, ordered_provider_items, proxy_max_body_bytes
 from ccproxy.health_store import (
     ensure_provider_entry,
@@ -66,6 +66,7 @@ PAYLOAD_TOO_LARGE_TERMS = (
     "请求体过大",
     "内容过大",
 )
+WEBSOCKET_RESPONSES_PATHS = {"/responses", "/v1/responses"}
 
 
 def should_failover_status(status_code: int) -> bool:
@@ -283,6 +284,212 @@ async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def _is_websocket_request(request: web.Request) -> bool:
+    upgrade = request.headers.get("Upgrade", "")
+    connection = request.headers.get("Connection", "")
+    return upgrade.casefold() == "websocket" and "upgrade" in connection.casefold()
+
+
+def _websocket_supported(provider: dict[str, Any]) -> bool:
+    value = provider.get("supports_websockets", provider.get("supports_websocket", False))
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on", "native"}
+    return bool(value)
+
+
+async def _record_provider_failure(
+    request: web.Request,
+    app: str,
+    provider_id: str,
+    provider: dict[str, Any],
+    detail: str,
+    cooldown_sec: int,
+    failure_threshold: int,
+) -> None:
+    await _update_health_state(
+        request,
+        lambda state: record_failure(
+            state,
+            app,
+            provider_id,
+            provider.get("name", provider_id),
+            detail,
+            cooldown_sec,
+            failure_threshold,
+            now_ts=time.time(),
+        ),
+    )
+
+
+async def _record_provider_success(
+    request: web.Request,
+    app: str,
+    provider_id: str,
+    provider: dict[str, Any],
+) -> None:
+    await _update_health_state(
+        request,
+        lambda state: record_success(
+            state,
+            app,
+            provider_id,
+            provider.get("name", provider_id),
+            now_ts=time.time(),
+        ),
+    )
+
+
+async def _pump_client_to_upstream(
+    client_ws: web.WebSocketResponse,
+    upstream_ws: Any,
+) -> None:
+    async for msg in client_ws:
+        if msg.type == WSMsgType.TEXT:
+            await upstream_ws.send_str(msg.data)
+        elif msg.type == WSMsgType.BINARY:
+            await upstream_ws.send_bytes(msg.data)
+        elif msg.type == WSMsgType.PING:
+            await upstream_ws.ping(msg.data)
+        elif msg.type == WSMsgType.PONG:
+            await upstream_ws.pong(msg.data)
+        elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED}:
+            await upstream_ws.close()
+            break
+        elif msg.type == WSMsgType.ERROR:
+            raise client_ws.exception() or RuntimeError("client websocket error")
+
+
+async def _pump_upstream_to_client(
+    upstream_ws: Any,
+    client_ws: web.WebSocketResponse,
+) -> None:
+    async for msg in upstream_ws:
+        if msg.type == WSMsgType.TEXT:
+            await client_ws.send_str(msg.data)
+        elif msg.type == WSMsgType.BINARY:
+            await client_ws.send_bytes(msg.data)
+        elif msg.type == WSMsgType.PING:
+            await client_ws.ping(msg.data)
+        elif msg.type == WSMsgType.PONG:
+            await client_ws.pong(msg.data)
+        elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED}:
+            await client_ws.close(code=upstream_ws.close_code or 1000)
+            break
+        elif msg.type == WSMsgType.ERROR:
+            raise upstream_ws.exception() or RuntimeError("upstream websocket error")
+
+
+async def _forward_websocket(request: web.Request, routed) -> web.StreamResponse:
+    app = routed.app
+    upstream_path = routed.upstream_path
+    if app != "codex" or upstream_path not in WEBSOCKET_RESPONSES_PATHS:
+        return proxy_error_response(
+            app,
+            status=426,
+            detail="websocket transport is only supported for codex responses",
+        )
+
+    config = load_config()
+    health_state = request.app["health_state"]
+    auto_failover = bool(config["proxy"].get("auto_failover", True))
+    cooldown_sec = int(config["proxy"].get("cooldown_sec", 60))
+    failure_threshold = int(config["proxy"].get("failure_threshold", 3))
+    attempts = provider_attempt_order(config, health_state, app)
+    adapter = ADAPTERS_BY_APP[app]
+    session: ClientSession = request.app["session"]
+    last_error: str | None = None
+
+    selected: tuple[str, dict[str, Any], Any, str] | None = None
+    for attempt_index, (provider_id, provider) in enumerate(attempts):
+        if not _websocket_supported(provider):
+            last_error = "provider websocket support is disabled"
+            logging.info("provider %s websocket skipped: %s", provider_id, last_error)
+            continue
+
+        upstream_url = build_upstream_websocket_url(
+            provider["base_url"],
+            upstream_path,
+            request.query_string,
+        )
+        headers = adapter.build_headers(request.headers, provider)
+        try:
+            upstream_ws = await session.ws_connect(
+                upstream_url,
+                headers=headers,
+                autoclose=False,
+                autoping=False,
+                max_msg_size=0,
+            )
+        except (ClientError, asyncio.TimeoutError, OSError) as exc:
+            last_error = _truncate_detail(_normalize_text(str(exc))) or str(exc)
+            await _record_provider_failure(
+                request,
+                app,
+                provider_id,
+                provider,
+                last_error,
+                cooldown_sec,
+                failure_threshold,
+            )
+            can_failover = auto_failover and attempt_index + 1 < len(attempts)
+            if can_failover:
+                logging.warning(
+                    "provider %s websocket handshake failed for %s: %s; trying next provider",
+                    provider_id,
+                    request.path_qs,
+                    exc,
+                )
+                continue
+            break
+
+        selected = (provider_id, provider, upstream_ws, upstream_url)
+        break
+
+    if selected is None:
+        return proxy_error_response(
+            app,
+            status=502,
+            detail=last_error or "no websocket-capable provider is available",
+        )
+
+    provider_id, provider, upstream_ws, upstream_url = selected
+    client_ws = web.WebSocketResponse(autoclose=False, autoping=False)
+    await client_ws.prepare(request)
+    await _record_provider_success(request, app, provider_id, provider)
+    logging.info("proxy websocket %s -> %s (%s)", request.path_qs, upstream_url, provider_id)
+
+    client_to_upstream = asyncio.create_task(_pump_client_to_upstream(client_ws, upstream_ws))
+    upstream_to_client = asyncio.create_task(_pump_upstream_to_client(upstream_ws, client_ws))
+    tasks = {client_to_upstream, upstream_to_client}
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+    except Exception as exc:
+        detail = _truncate_detail(_normalize_text(str(exc))) or str(exc)
+        logging.warning("provider %s websocket stream failed for %s: %s", provider_id, request.path_qs, detail)
+        await _record_provider_failure(
+            request,
+            app,
+            provider_id,
+            provider,
+            detail,
+            cooldown_sec,
+            failure_threshold,
+        )
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await upstream_ws.close()
+        await client_ws.close()
+
+    return client_ws
+
+
 async def forward(request: web.Request) -> web.StreamResponse:
     routed = route_request(request.path)
     if routed is None:
@@ -293,6 +500,8 @@ async def forward(request: web.Request) -> web.StreamResponse:
             },
             status=404,
         )
+    if _is_websocket_request(request):
+        return await _forward_websocket(request, routed)
 
     app = routed.app
     upstream_path = routed.upstream_path

@@ -40,6 +40,7 @@ def build_provider_rows(app: str) -> list[dict[str, object]]:
                 "current": provider_id == current,
                 "model": provider.get("model"),
                 "auth_mode": provider.get("auth_mode", "bearer"),
+                "supports_websockets": bool(provider.get("supports_websockets", False)),
             }
         )
     return rows
@@ -80,11 +81,13 @@ def build_current_provider_summary(app: str) -> dict[str, object]:
         "selected_label": format_provider_label(provider_id, provider.get("name", provider_id)),
         "selected_status": "cooldown" if current_in_cooldown else "ready",
         "selected_cooldown_until": format_timestamp(current_entry.get("cooldown_until")),
+        "selected_supports_websockets": bool(provider.get("supports_websockets", False)),
         "effective_provider_id": effective_id,
         "effective_provider_name": effective_provider.get("name", effective_id),
         "effective_priority": provider_priority(effective_provider),
         "effective_base_url": effective_provider.get("base_url"),
         "effective_label": format_provider_label(effective_id, effective_provider.get("name", effective_id)),
+        "effective_supports_websockets": bool(effective_provider.get("supports_websockets", False)),
         "effective_matches_selected": effective_matches_current,
         "effective_reason": effective_reason,
     }
@@ -126,6 +129,7 @@ def build_health_snapshot(app: str | None = None) -> dict[str, object]:
                     "last_error": entry.get("last_error"),
                     "model": provider.get("model"),
                     "auth_mode": provider.get("auth_mode", "bearer"),
+                    "supports_websockets": bool(provider.get("supports_websockets", False)),
                 }
             )
         result["apps"][app_name] = rows

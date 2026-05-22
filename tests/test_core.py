@@ -5,13 +5,14 @@ import time
 import urllib.error
 from pathlib import Path
 
-from ccproxy.adapters import build_upstream_url, route_request
+from ccproxy.adapters import build_upstream_url, build_upstream_websocket_url, route_request
 from ccproxy.checks import (
     CODEX_CHECK_USER_AGENT_ENV,
     CHECK_HTTP_ERROR_RETURN_CODE,
     CHECK_TIMEOUT_RETURN_CODE,
     CheckResult,
     codex_check_user_agent,
+    _extract_responses_text,
     _run_codex_check,
     _run_subprocess,
     next_provider_candidates,
@@ -45,6 +46,7 @@ from ccproxy.health_store import (
     reorder_providers_by_cooldown,
 )
 from ccproxy.proxy import (
+    _is_websocket_request,
     build_proxy_error_payload,
     forward,
     has_ready_failover_candidate,
@@ -202,6 +204,13 @@ def test_forward_disables_aiohttp_auto_accept_encoding(monkeypatch) -> None:
     assert "Accept-Encoding" not in captured["headers"]
 
 
+def test_is_websocket_request_detects_upgrade() -> None:
+    class Request:
+        headers = {"Connection": "keep-alive, Upgrade", "Upgrade": "websocket"}
+
+    assert _is_websocket_request(Request()) is True
+
+
 def test_build_upstream_url_dedupes_v1() -> None:
     url = build_upstream_url("https://example.com/v1", "/v1/responses")
     assert url == "https://example.com/v1/responses"
@@ -210,6 +219,11 @@ def test_build_upstream_url_dedupes_v1() -> None:
 def test_build_upstream_url_appends_v1_path() -> None:
     url = build_upstream_url("https://example.com", "/v1/messages")
     assert url == "https://example.com/v1/messages"
+
+
+def test_build_upstream_websocket_url_converts_https() -> None:
+    url = build_upstream_websocket_url("https://example.com/v1", "/v1/responses", "a=b")
+    assert url == "wss://example.com/v1/responses?a=b"
 
 
 def test_route_request_maps_codex_aliases() -> None:
@@ -822,6 +836,7 @@ def test_build_test_snapshot_collects_results(monkeypatch) -> None:
         app: str,
         selector: str | None = None,
         timeout_sec: float | None = None,
+        transport: str = "http",
     ) -> CheckResult:
         provider_id = selector or "missing"
         return CheckResult(
@@ -953,6 +968,11 @@ def test_run_codex_check_accepts_non_stream_responses_marker(monkeypatch) -> Non
     assert timed_out is False
 
 
+def test_extract_responses_text_accepts_websocket_delta_and_item() -> None:
+    assert _extract_responses_text({"type": "response.output_text.delta", "delta": "CCPROXY_CHECK_OK"}) == "CCPROXY_CHECK_OK"
+    assert _extract_responses_text({"item": {"content": [{"text": "nested"}]}}) == "nested"
+
+
 def test_run_codex_check_keeps_usage_limited_provider_failed(monkeypatch) -> None:
     class FakeHTTPError(urllib.error.HTTPError):
         pass
@@ -1010,6 +1030,7 @@ def test_cmd_test_text_mode_streams_rows_without_building_snapshot(monkeypatch, 
         app: str,
         selector: str | None = None,
         timeout_sec: float | None = None,
+        transport: str = "http",
     ) -> CheckResult:
         seen_timeouts.append(timeout_sec)
         provider_id = selector or "missing"

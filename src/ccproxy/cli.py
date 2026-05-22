@@ -143,6 +143,7 @@ def _add_add_parser(sub) -> None:
     )
     parser.add_argument("--set-current", action="store_true", help=t("Set this provider as current immediately.", "添加后立刻设为当前 provider。"))
     parser.add_argument("--priority", type=int, help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"))
+    parser.add_argument("--supports-websockets", choices=("on", "off"), help=t("Mark whether this Codex upstream supports native Responses WebSocket.", "标记这个 Codex 上游是否支持原生 Responses WebSocket。"))
 
 
 def _add_list_parser(sub) -> None:
@@ -175,6 +176,7 @@ def _add_update_parser(sub) -> None:
     parser.add_argument("--model", help=t("Default model for Codex launcher.", "Codex 启动时默认模型。"))
     parser.add_argument("--auth-mode", choices=("bearer", "x-api-key", "both"), help=t("Auth mode for Claude upstreams.", "Claude 上游的鉴权模式。"))
     parser.add_argument("--priority", type=int, help=t("Lower number means higher failover priority.", "数字越小，自动故障转移优先级越高。"))
+    parser.add_argument("--supports-websockets", choices=("on", "off"), help=t("Mark whether this Codex upstream supports native Responses WebSocket.", "标记这个 Codex 上游是否支持原生 Responses WebSocket。"))
     parser.add_argument("--set-current", action="store_true", help=t("Set this provider as current immediately.", "更新后立刻设为当前 provider。"))
 
 
@@ -191,6 +193,7 @@ def _add_check_parser(sub) -> None:
     parser.add_argument("app", choices=APP_CHOICES)
     parser.add_argument("provider", nargs="?", help=t("Provider ID first, then exact provider name. Defaults to current provider.", "优先传 provider ID，其次精确名称；默认检查当前 provider。"))
     parser.add_argument("--timeout-sec", type=float, help=t(f"Per-provider timeout in seconds. Defaults to {DEFAULT_CHECK_TIMEOUT_SEC:g}.", f"单个 provider 检查超时秒数；默认 {DEFAULT_CHECK_TIMEOUT_SEC:g} 秒。"))
+    parser.add_argument("--websocket", action="store_true", help=t("Check Codex Responses WebSocket transport.", "检查 Codex Responses WebSocket 传输。"))
 
 
 def _add_test_parser(sub) -> None:
@@ -199,6 +202,7 @@ def _add_test_parser(sub) -> None:
     parser.add_argument("app", nargs="?", choices=APP_CHOICES)
     parser.add_argument("--json", action="store_true", help=t("Print test result as JSON.", "以 JSON 输出测试结果。"))
     parser.add_argument("--timeout-sec", type=float, help=t(f"Per-provider timeout in seconds. Defaults to {DEFAULT_CHECK_TIMEOUT_SEC:g}.", f"单个 provider 检查超时秒数；默认 {DEFAULT_CHECK_TIMEOUT_SEC:g} 秒。"))
+    parser.add_argument("--websocket", action="store_true", help=t("Test Codex providers through Responses WebSocket.", "通过 Responses WebSocket 测试 Codex provider。"))
 
 
 def _add_next_parser(sub) -> None:
@@ -381,6 +385,7 @@ def _build_test_row(
         "detail": _check_detail(result),
         "returncode": result.returncode,
         "timed_out": result.timed_out,
+        "transport": result.transport,
     }
 
 
@@ -389,13 +394,19 @@ def _iter_test_rows(
     ordered: list[tuple[str, dict[str, object]]],
     current: str | None,
     timeout_sec: float | None = None,
+    transport: str = "http",
 ):
     for provider_id, provider in ordered:
-        result = run_check(app_name, provider_id, timeout_sec=timeout_sec)
+        result = run_check(app_name, provider_id, timeout_sec=timeout_sec, transport=transport)
         yield _build_test_row(provider_id, provider, current, result)
 
 
-def build_test_snapshot(app: str | None = None, timeout_sec: float | None = None) -> dict[str, object]:
+def build_test_snapshot(
+    app: str | None = None,
+    timeout_sec: float | None = None,
+    *,
+    transport: str = "http",
+) -> dict[str, object]:
     data = load_config()
     apps = [normalize_app(app)] if app else list(APP_CHOICES)
     snapshot: dict[str, object] = {"apps": {}, "summary": {"ok": 0, "fail": 0, "total": 0}}
@@ -404,7 +415,7 @@ def build_test_snapshot(app: str | None = None, timeout_sec: float | None = None
     for app_name in apps:
         ordered = ordered_provider_items(data, app_name)
         current = current_provider_id(data, app_name)
-        rows = list(_iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec))
+        rows = list(_iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec, transport=transport))
         snapshot["apps"][app_name] = rows
         for row in rows:
             update_test_summary(summary, row)
@@ -499,6 +510,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         auth_mode=args.auth_mode,
         set_current=args.set_current,
         priority=args.priority,
+        supports_websockets=(args.supports_websockets == "on") if getattr(args, "supports_websockets", None) is not None else None,
     )
     print(t(f"saved {args.app} provider: {result['provider_label']}", f"已保存 {args.app} provider: {result['provider_label']}"))
     if args.set_current:
@@ -516,6 +528,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         model=args.model,
         auth_mode=args.auth_mode,
         priority=args.priority,
+        supports_websockets=(args.supports_websockets == "on") if args.supports_websockets is not None else None,
         set_current=args.set_current,
     )
     if not result["changed"]:
@@ -559,11 +572,12 @@ def cmd_use(app: str, selector: str) -> int:
     return 0
 
 
-def cmd_check(app: str, provider: str | None, timeout_sec: float | None = None) -> int:
-    result = run_check_action(app, provider, timeout_sec=timeout_sec)
+def cmd_check(app: str, provider: str | None, timeout_sec: float | None = None, websocket: bool = False) -> int:
+    transport = "websocket" if websocket else "http"
+    result = run_check_action(app, provider, timeout_sec=timeout_sec, transport=transport)
     status = t("OK", "成功") if result.success else t("FAIL", "失败")
     provider_label = format_provider_label(result.provider_id, result.provider_name)
-    print(f"[{status}] {result.app} {provider_label} {result.duration_sec:.1f}s")
+    print(f"[{status}] {result.app} {provider_label} {transport} {result.duration_sec:.1f}s")
     if not result.success:
         if result.stderr.strip():
             print(result.stderr.strip())
@@ -586,9 +600,10 @@ def _print_test_row(row: dict[str, object]) -> None:
         print(f"  {row['detail']}", flush=True)
 
 
-def cmd_test(app: str | None, json_mode: bool, timeout_sec: float | None = None) -> int:
+def cmd_test(app: str | None, json_mode: bool, timeout_sec: float | None = None, websocket: bool = False) -> int:
+    transport = "websocket" if websocket else "http"
     if json_mode:
-        snapshot = build_test_snapshot(app, timeout_sec=timeout_sec)
+        snapshot = build_test_snapshot(app, timeout_sec=timeout_sec, transport=transport)
         print(json.dumps(snapshot, indent=2, sort_keys=True))
         return 0 if snapshot["summary"]["fail"] == 0 else 1
 
@@ -603,7 +618,7 @@ def cmd_test(app: str | None, json_mode: bool, timeout_sec: float | None = None)
             print(t("  no providers configured", "  没有配置 provider"), flush=True)
             continue
         current = current_provider_id(data, app_name)
-        for row in _iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec):
+        for row in _iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec, transport=transport):
             _print_test_row(row)
             update_test_summary(summary, row)
 
@@ -813,9 +828,9 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "delete":
             raise SystemExit(cmd_delete(args.app, args.selector))
         if args.command == "check":
-            raise SystemExit(cmd_check(args.app, args.provider, args.timeout_sec))
+            raise SystemExit(cmd_check(args.app, args.provider, args.timeout_sec, args.websocket))
         if args.command == "test":
-            raise SystemExit(cmd_test(args.app, args.json, args.timeout_sec))
+            raise SystemExit(cmd_test(args.app, args.json, args.timeout_sec, args.websocket))
         if args.command == "next":
             raise SystemExit(cmd_next(args.app))
         if args.command == "health":

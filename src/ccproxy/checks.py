@@ -9,11 +9,14 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ccproxy.adapters import build_upstream_url
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType
+
+from ccproxy.adapters import build_upstream_url, build_upstream_websocket_url
 from ccproxy.config import (
     current_provider_id,
     load_config,
@@ -29,8 +32,10 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CHECK_TIMEOUT_SEC = 45.0
 CHECK_TIMEOUT_RETURN_CODE = 124
 CHECK_HTTP_ERROR_RETURN_CODE = 1
+CHECK_WEBSOCKET_UNSUPPORTED_RETURN_CODE = 2
 DEFAULT_CODEX_TUI_VERSION = "0.131.0"
 CODEX_CHECK_USER_AGENT_ENV = "CCPROXY_CODEX_CHECK_USER_AGENT"
+RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06"
 
 
 @dataclass
@@ -45,6 +50,7 @@ class CheckResult:
     stderr: str
     returncode: int
     timed_out: bool = False
+    transport: str = "http"
 
 
 def _resolve_provider(
@@ -216,6 +222,12 @@ def _codex_check_headers(provider: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _codex_websocket_headers(provider: dict[str, Any]) -> dict[str, str]:
+    headers = _codex_check_headers(provider)
+    headers["OpenAI-Beta"] = RESPONSES_WEBSOCKET_BETA
+    return headers
+
+
 def _codex_check_payload(provider: dict[str, Any]) -> bytes:
     model = provider.get("model") or "gpt-5.4"
     return json.dumps(
@@ -226,6 +238,13 @@ def _codex_check_payload(provider: dict[str, Any]) -> bytes:
             "max_output_tokens": 16,
         }
     ).encode()
+
+
+def _codex_websocket_check_payload(provider: dict[str, Any]) -> str:
+    payload = json.loads(_codex_check_payload(provider).decode())
+    payload["type"] = "response.create"
+    payload["stream"] = True
+    return json.dumps(payload)
 
 
 def _decode_http_body(body: bytes) -> str:
@@ -252,6 +271,25 @@ def _extract_responses_text(payload: object) -> str:
         output_text = payload.get("output_text")
         if isinstance(output_text, str):
             return output_text
+        delta = payload.get("delta")
+        if isinstance(delta, str):
+            return delta
+        text = payload.get("text")
+        if isinstance(text, str):
+            return text
+        content = payload.get("content")
+        if isinstance(content, list):
+            content_parts: list[str] = []
+            for content_item in content:
+                content_text = _extract_responses_text(content_item)
+                if content_text:
+                    content_parts.append(content_text)
+            if content_parts:
+                return "\n".join(content_parts)
+        item = payload.get("item")
+        item_text = _extract_responses_text(item)
+        if item_text:
+            return item_text
         output = payload.get("output")
         if isinstance(output, list):
             parts: list[str] = []
@@ -305,6 +343,75 @@ def _run_codex_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int,
         text = _extract_responses_text(payload)
     return 0, text, "", False
 
+
+async def _run_codex_websocket_check_async(
+    provider: dict[str, Any],
+    timeout_sec: float,
+) -> tuple[int, str, str, bool]:
+    if not provider.get("supports_websockets", False):
+        return (
+            CHECK_WEBSOCKET_UNSUPPORTED_RETURN_CODE,
+            "",
+            "ERROR: provider websocket support is disabled; set supports_websockets=true first\n",
+            False,
+        )
+
+    url = build_upstream_websocket_url(str(provider["base_url"]), "/v1/responses")
+    timeout = ClientTimeout(total=timeout_sec, connect=min(timeout_sec, 10), sock_connect=min(timeout_sec, 10), sock_read=timeout_sec)
+    text_parts: list[str] = []
+    completed = False
+    try:
+        async with ClientSession(timeout=timeout) as session:
+            async with session.ws_connect(
+                url,
+                headers=_codex_websocket_headers(provider),
+                autoclose=True,
+                autoping=True,
+                max_msg_size=0,
+            ) as ws:
+                await ws.send_str(_codex_websocket_check_payload(provider))
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            event = json.loads(msg.data)
+                        except json.JSONDecodeError:
+                            continue
+                        event_type = event.get("type") if isinstance(event, dict) else None
+                        text = _extract_responses_text(event)
+                        if text:
+                            text_parts.append(text)
+                        if event_type in {"response.completed", "response.done"}:
+                            completed = True
+                            break
+                        if event_type == "error":
+                            return CHECK_HTTP_ERROR_RETURN_CODE, "", f"ERROR: {msg.data}\n", False
+                    elif msg.type == WSMsgType.ERROR:
+                        raise ws.exception() or RuntimeError("websocket error")
+                    elif msg.type in {WSMsgType.CLOSED, WSMsgType.CLOSE, WSMsgType.CLOSING}:
+                        break
+    except asyncio.TimeoutError:
+        return CHECK_TIMEOUT_RETURN_CODE, "", f"ERROR: websocket check timed out after {_format_timeout_sec(timeout_sec)}s\n", True
+    except (ClientError, OSError, ValueError) as exc:
+        return CHECK_HTTP_ERROR_RETURN_CODE, "", f"ERROR: websocket {exc}\n", False
+
+    text = "\n".join(text_parts)
+    if completed or CHECK_MARKER in text:
+        return 0, text, "", False
+    return CHECK_HTTP_ERROR_RETURN_CODE, text, "ERROR: websocket stream ended before response.completed\n", False
+
+
+def _run_codex_websocket_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
+    try:
+        return asyncio.run(_run_codex_websocket_check_async(provider, timeout_sec))
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" not in str(exc):
+            raise
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run_codex_websocket_check_async(provider, timeout_sec))
+        finally:
+            loop.close()
+
 def _run_claude_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int, str, str, bool]:
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -351,7 +458,13 @@ def _run_claude_check(provider: dict[str, Any], timeout_sec: float) -> tuple[int
         settings_path.unlink(missing_ok=True)
 
 
-def run_check(app: str, selector: str | None = None, timeout_sec: float | None = None) -> CheckResult:
+def run_check(
+    app: str,
+    selector: str | None = None,
+    timeout_sec: float | None = None,
+    *,
+    transport: str = "http",
+) -> CheckResult:
     timeout_sec = resolve_check_timeout(timeout_sec)
     data = load_config()
     provider_id, provider = _resolve_provider(data, app, selector)
@@ -359,7 +472,10 @@ def run_check(app: str, selector: str | None = None, timeout_sec: float | None =
 
     started = time.monotonic()
     if app == "codex":
-        returncode, stdout, stderr, timed_out = _run_codex_check(provider, timeout_sec)
+        if transport == "websocket":
+            returncode, stdout, stderr, timed_out = _run_codex_websocket_check(provider, timeout_sec)
+        else:
+            returncode, stdout, stderr, timed_out = _run_codex_check(provider, timeout_sec)
         success = returncode == 0 and CHECK_MARKER in stdout
     elif app == "claude":
         returncode, stdout, stderr, timed_out = _run_claude_check(provider, timeout_sec)
@@ -386,6 +502,7 @@ def run_check(app: str, selector: str | None = None, timeout_sec: float | None =
         stderr=stderr,
         returncode=returncode,
         timed_out=timed_out,
+        transport=transport,
     )
 
 

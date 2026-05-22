@@ -68,6 +68,10 @@ def render_bash_completion() -> str:
               COMPREPLY=( $(compgen -W "bearer x-api-key both" -- "$cur") )
               return 0
               ;;
+            --supports-websockets)
+              COMPREPLY=( $(compgen -W "on off" -- "$cur") )
+              return 0
+              ;;
             --auto-failover)
               COMPREPLY=( $(compgen -W "on off" -- "$cur") )
               return 0
@@ -96,18 +100,18 @@ def render_bash_completion() -> str:
                   opts="--db-path"
                   ;;
                 add)
-                  opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
+                  opts="--name --base-url --api-key --model --auth-mode --priority --supports-websockets --set-current"
                   ;;
                 update)
-                  opts="--name --base-url --api-key --model --auth-mode --priority --set-current"
+                  opts="--name --base-url --api-key --model --auth-mode --priority --supports-websockets --set-current"
                   ;;
                 check)
-                  opts="--timeout-sec"
+                  opts="--timeout-sec --websocket"
                   ;;
                 test|health)
                   opts="--json"
                   if [[ "$cmd" == "test" ]]; then
-                    opts="$opts --timeout-sec"
+                    opts="$opts --timeout-sec --websocket"
                   fi
                   ;;
                 service)
@@ -281,6 +285,7 @@ def render_zsh_completion() -> str:
                 '--model[default model for codex]:model:' \
                 '--auth-mode[auth mode]:(bearer x-api-key both)' \
                 '--priority[lower number means higher failover priority]:priority:' \
+                '--supports-websockets[mark native Responses WebSocket support]:(on off)' \
                 '--set-current[set as current immediately]'
               ;;
             list|current|next)
@@ -288,7 +293,7 @@ def render_zsh_completion() -> str:
               ;;
             test|health)
               if [[ "$words[2]" == "test" ]]; then
-                _arguments '--json[print result as json]' '--timeout-sec[per-provider timeout in seconds]:seconds:' '2:app:(codex claude)'
+                _arguments '--json[print result as json]' '--timeout-sec[per-provider timeout in seconds]:seconds:' '--websocket[test Responses WebSocket transport]' '2:app:(codex claude)'
               else
                 _arguments '--json[print result as json]' '2:app:(codex claude)'
               fi
@@ -302,7 +307,7 @@ def render_zsh_completion() -> str:
                 _ccproxy_provider_ids "$words[3]"
                 return
               fi
-              _arguments '--timeout-sec[per-provider timeout in seconds]:seconds:'
+              _arguments '--timeout-sec[per-provider timeout in seconds]:seconds:' '--websocket[check Responses WebSocket transport]'
               ;;
             show|delete|use)
               if (( CURRENT == 3 )); then
@@ -330,6 +335,7 @@ def render_zsh_completion() -> str:
                 '--model[default model for codex]:model:' \
                 '--auth-mode[auth mode]:(bearer x-api-key both)' \
                 '--priority[lower number means higher failover priority]:priority:' \
+                '--supports-websockets[mark native Responses WebSocket support]:(on off)' \
                 '--set-current[set as current immediately]'
               ;;
             service)
@@ -452,6 +458,7 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l model
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l auth-mode -a 'bearer x-api-key both'
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l priority
+        complete -c ccproxy -n '__fish_seen_subcommand_from add' -l supports-websockets -a 'on off'
         complete -c ccproxy -n '__fish_seen_subcommand_from add' -l set-current
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l name
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l base-url
@@ -459,9 +466,11 @@ def render_fish_completion() -> str:
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l model
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l auth-mode -a 'bearer x-api-key both'
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l priority
+        complete -c ccproxy -n '__fish_seen_subcommand_from update' -l supports-websockets -a 'on off'
         complete -c ccproxy -n '__fish_seen_subcommand_from update' -l set-current
         complete -c ccproxy -n '__fish_seen_subcommand_from health test' -l json
         complete -c ccproxy -n '__fish_seen_subcommand_from check test' -l timeout-sec
+        complete -c ccproxy -n '__fish_seen_subcommand_from check test' -l websocket
 
         complete -c ccproxy -n '__fish_seen_subcommand_from codex' -l provider -a '(__fish_ccproxy_provider_ids codex)'
         complete -c ccproxy -n '__fish_seen_subcommand_from claude' -l provider -a '(__fish_ccproxy_provider_ids claude)'

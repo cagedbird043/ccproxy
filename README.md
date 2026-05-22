@@ -40,6 +40,7 @@
 - 本地 proxy 前台/后台运行
 - `codex` / `claude` 临时启动器
 - 从现有 `cc-switch` 数据库导入 provider
+- Codex Responses WebSocket 原生中转的实验性支持
 
 ## 安装
 
@@ -158,9 +159,11 @@ ccproxy list codex
 ccproxy list claude
 ccproxy check codex
 ccproxy check codex --timeout-sec 20
+ccproxy check codex --websocket
 ccproxy check claude
 ccproxy test codex
 ccproxy test codex --timeout-sec 20
+ccproxy test codex --websocket
 ccproxy test
 ccproxy health
 ccproxy health --json
@@ -196,6 +199,32 @@ ccproxy proxy config set --auto-failover off
 `ccproxy proxy status` 不只会看 pid 文件，也会看本地健康探针，所以如果你是用 `systemd` 托管代理，它现在也能正确显示为运行中。
 如果你修改了 `host`、`port` 或 `max_body_mb`，需要重启代理进程后才会生效。
 
+### Codex WebSocket
+
+Codex 的 `supports_websockets` 是前台进程启动时读取的静态能力开关；它不知道 ccproxy 后面每个中转站是否支持 WebSocket。ccproxy 因此把 WebSocket 能力放到 provider 配置里：
+
+```bash
+ccproxy update codex timicc --supports-websockets on
+ccproxy update codex old-provider --supports-websockets off
+ccproxy test codex --websocket
+```
+
+当前实现的是原生 WebSocket 中转：
+
+```text
+Codex WebSocket -> ccproxy -> provider WebSocket
+```
+
+也就是说，只有标记了 `supports_websockets=true` 的 Codex provider 才会被 WebSocket 路径尝试。握手阶段失败时可以尝试下一个 provider；一旦 WebSocket 已经建立并开始传输，ccproxy 不会在同一条连接中偷偷切换 provider，避免把 Codex 的 `previous_response_id` / turn state 搞乱。
+
+如果当前 provider 标记支持 WebSocket，`ccproxy codex` 会在临时 Codex 配置里写入：
+
+```toml
+supports_websockets = true
+```
+
+否则仍然写入 `false`，继续走稳定的 HTTP/SSE 路径。未来如果要让 Codex 永远连本地 WebSocket、而不支持 WebSocket 的上游自动桥接到 HTTP/SSE，需要再实现 `WebSocket -> HTTP/SSE bridge`；这不是当前版本的默认行为。
+
 ### 4. 用代理模式启动 Codex / Claude
 
 ```bash
@@ -219,6 +248,7 @@ ccproxy use codex yescodex
 ccproxy use codex backup-provider
 ccproxy show codex yescodex
 ccproxy update codex yescodex --priority 10
+ccproxy update codex yescodex --supports-websockets on
 ccproxy delete codex old-provider
 
 ccproxy use claude ikun-1m
@@ -228,6 +258,7 @@ ccproxy test codex
 ccproxy test claude
 ccproxy test --json
 ccproxy test codex --timeout-sec 20
+ccproxy test codex --websocket
 
 ccproxy next codex
 ccproxy next claude

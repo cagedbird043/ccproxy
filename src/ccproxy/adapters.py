@@ -93,6 +93,28 @@ def build_upstream_url(base_url: str, request_path: str, query_string: str = "")
     return urlunsplit(result)
 
 
+def build_upstream_websocket_url(base_url: str, request_path: str, query_string: str = "") -> str:
+    http_url = build_upstream_url(base_url, request_path, query_string)
+    parsed = urlsplit(http_url)
+    if parsed.scheme == "https":
+        scheme = "wss"
+    elif parsed.scheme == "http":
+        scheme = "ws"
+    elif parsed.scheme in {"ws", "wss"}:
+        scheme = parsed.scheme
+    else:
+        raise ValueError(f"unsupported websocket upstream scheme: {parsed.scheme}")
+    return urlunsplit(
+        SplitResult(
+            scheme=scheme,
+            netloc=parsed.netloc,
+            path=parsed.path,
+            query=parsed.query,
+            fragment="",
+        )
+    )
+
+
 def route_request(path: str) -> RoutedRequest | None:
     for adapter in ADAPTERS:
         upstream_path = adapter.route(path)

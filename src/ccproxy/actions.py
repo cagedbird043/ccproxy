@@ -76,8 +76,14 @@ def check_detail(result: CheckResult) -> str | None:
     return None
 
 
-def run_check_action(app: str, provider: str | None = None, timeout_sec: float | None = None) -> CheckResult:
-    return run_check(app, provider, timeout_sec=timeout_sec)
+def run_check_action(
+    app: str,
+    provider: str | None = None,
+    timeout_sec: float | None = None,
+    *,
+    transport: str = "http",
+) -> CheckResult:
+    return run_check(app, provider, timeout_sec=timeout_sec, transport=transport)
 
 
 def build_test_row(
@@ -97,6 +103,7 @@ def build_test_row(
         "detail": check_detail(result),
         "returncode": result.returncode,
         "timed_out": result.timed_out,
+        "transport": result.transport,
     }
 
 
@@ -105,9 +112,10 @@ def iter_test_rows(
     ordered: list[tuple[str, dict[str, object]]],
     current: str | None,
     timeout_sec: float | None = None,
+    transport: str = "http",
 ) -> Iterator[dict[str, object]]:
     for provider_id, provider in ordered:
-        result = run_check_action(app_name, provider_id, timeout_sec=timeout_sec)
+        result = run_check_action(app_name, provider_id, timeout_sec=timeout_sec, transport=transport)
         yield build_test_row(provider_id, provider, current, result)
 
 
@@ -119,7 +127,12 @@ def update_test_summary(summary: dict[str, int], row: dict[str, object]) -> None
         summary["fail"] += 1
 
 
-def build_test_snapshot(app: str | None = None, timeout_sec: float | None = None) -> dict[str, object]:
+def build_test_snapshot(
+    app: str | None = None,
+    timeout_sec: float | None = None,
+    *,
+    transport: str = "http",
+) -> dict[str, object]:
     data = load_config()
     apps = [normalize_app(app)] if app else list(APP_CHOICES)
     snapshot: dict[str, object] = {"apps": {}, "summary": {"ok": 0, "fail": 0, "total": 0}}
@@ -128,7 +141,7 @@ def build_test_snapshot(app: str | None = None, timeout_sec: float | None = None
     for app_name in apps:
         ordered = ordered_provider_items(data, app_name)
         current = current_provider_id(data, app_name)
-        rows = list(iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec))
+        rows = list(iter_test_rows(app_name, ordered, current, timeout_sec=timeout_sec, transport=transport))
         snapshot["apps"][app_name] = rows
         for row in rows:
             update_test_summary(summary, row)
@@ -160,6 +173,7 @@ def add_provider_action(
     auth_mode: str | None = None,
     set_current: bool = False,
     priority: int | None = None,
+    supports_websockets: bool | None = None,
 ) -> dict[str, object]:
     data = load_config()
     provider = {
@@ -170,6 +184,8 @@ def add_provider_action(
         "auth_mode": auth_mode or "bearer",
         "priority": priority if priority is not None else DEFAULT_PROVIDER_PRIORITY,
     }
+    if supports_websockets is not None:
+        provider["supports_websockets"] = supports_websockets
     upsert_provider(data, app, provider_id, provider, set_current=set_current)
     save_config(data)
     return {
@@ -191,6 +207,7 @@ def update_provider_action(
     model: str | None = None,
     auth_mode: str | None = None,
     priority: int | None = None,
+    supports_websockets: bool | None = None,
     set_current: bool = False,
 ) -> dict[str, object]:
     data = load_config()
@@ -203,6 +220,7 @@ def update_provider_action(
         ("model", model),
         ("auth_mode", auth_mode),
         ("priority", priority),
+        ("supports_websockets", supports_websockets),
     ):
         if value is None:
             continue

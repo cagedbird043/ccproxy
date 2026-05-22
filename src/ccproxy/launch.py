@@ -155,7 +155,7 @@ def _prepare_codex_temp_home(temp_home: Path) -> None:
         _safe_link_or_copy(child, target)
 
 
-def _codex_proxy_config(model: str | None) -> str:
+def _codex_proxy_config(model: str | None, supports_websockets: bool = False) -> str:
     chosen_model = model or "gpt-5.4"
     return "\n".join(
         [
@@ -168,6 +168,7 @@ def _codex_proxy_config(model: str | None) -> str:
             'base_url = "http://127.0.0.1:15721/v1"',
             'wire_api = "responses"',
             "requires_openai_auth = false",
+            f"supports_websockets = {'true' if supports_websockets else 'false'}",
             "",
         ]
     )
@@ -191,7 +192,12 @@ def launch_codex(selector: str | None, extra_args: list[str]) -> int:
     with tempfile.TemporaryDirectory(prefix="ccproxy-codex-", dir=runtime_dir()) as temp_dir:
         temp_home = Path(temp_dir)
         _prepare_codex_temp_home(temp_home)
-        (temp_home / "config.toml").write_text(_codex_proxy_config(provider.get("model")))
+        (temp_home / "config.toml").write_text(
+            _codex_proxy_config(
+                provider.get("model"),
+                bool(provider.get("supports_websockets", False)),
+            )
+        )
         (temp_home / "auth.json").write_text(
             json.dumps({"OPENAI_API_KEY": "ccproxy-placeholder"}, indent=2) + "\n"
         )
