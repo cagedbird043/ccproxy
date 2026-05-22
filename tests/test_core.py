@@ -71,6 +71,137 @@ def test_resolve_provider_selector_prefers_id() -> None:
     assert provider["name"] == "Shared"
 
 
+def test_codex_adapter_strips_accept_encoding_before_upstream() -> None:
+    from ccproxy.adapters import CodexAdapter
+
+    headers = CodexAdapter().build_headers(
+        {
+            "Accept-Encoding": "gzip, br",
+            "Authorization": "Bearer old",
+            "Content-Length": "2",
+            "Host": "127.0.0.1",
+            "User-Agent": "codex-test",
+        },
+        {"api_key": "sk-new"},
+    )
+
+    assert "Accept-Encoding" not in headers
+    assert headers["Authorization"] == "Bearer sk-new"
+    assert headers["User-Agent"] == "codex-test"
+
+
+def test_claude_adapter_strips_accept_encoding_before_upstream() -> None:
+    from ccproxy.adapters import ClaudeAdapter
+
+    headers = ClaudeAdapter().build_headers(
+        {
+            "Accept-Encoding": "gzip, br",
+            "Authorization": "Bearer old",
+            "Content-Length": "2",
+            "Host": "127.0.0.1",
+            "User-Agent": "claude-test",
+        },
+        {"api_key": "sk-new"},
+    )
+
+    assert "Accept-Encoding" not in headers
+    assert headers["Authorization"] == "Bearer sk-new"
+    assert headers["User-Agent"] == "claude-test"
+
+
+def test_response_hop_by_hop_headers_strip_content_encoding() -> None:
+    from ccproxy.proxy import HOP_BY_HOP_HEADERS
+
+    assert "content-encoding" in HOP_BY_HOP_HEADERS
+
+
+def test_forward_disables_aiohttp_auto_accept_encoding(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccproxy.proxy.load_config",
+        lambda: {
+            "proxy": {
+                "auto_failover": False,
+                "cooldown_sec": 60,
+                "failure_threshold": 3,
+                "retry_attempts": 1,
+            },
+            "apps": {
+                "codex": {
+                    "current": "good",
+                    "providers": {
+                        "good": {"name": "Good", "base_url": "https://example.com", "api_key": "k"},
+                    },
+                },
+                "claude": {"current": None, "providers": {}},
+            },
+        },
+    )
+
+    captured = {}
+
+    class FakeContent:
+        async def iter_chunked(self, _size: int):
+            yield b'{"ok":true}'
+
+    class FakeUpstream:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+        content = FakeContent()
+
+        async def read(self):
+            return b""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def request(self, _method, _url, **kwargs):
+            captured.update(kwargs)
+            return FakeUpstream()
+
+    class FakeStreamResponse:
+        def __init__(self, *, status: int, headers: dict[str, str]):
+            self.status = status
+            self.headers = headers
+            self.body = b""
+
+        async def prepare(self, _request):
+            return self
+
+        async def write(self, chunk: bytes):
+            self.body += chunk
+
+        async def write_eof(self):
+            return None
+
+    class FakeRequest:
+        def __init__(self):
+            self.path = "/responses"
+            self.path_qs = "/responses"
+            self.query_string = ""
+            self.method = "POST"
+            self.headers = {"Accept-Encoding": "gzip, br"}
+            self.app = {
+                "session": FakeSession(),
+                "health_state": default_health_state(),
+                "health_lock": asyncio.Lock(),
+            }
+
+        async def read(self):
+            return b"{}"
+
+    monkeypatch.setattr("ccproxy.proxy.web.StreamResponse", FakeStreamResponse)
+
+    response = asyncio.run(forward(FakeRequest()))
+
+    assert response.status == 200
+    assert captured["skip_auto_headers"] == {"Accept-Encoding"}
+    assert "Accept-Encoding" not in captured["headers"]
+
+
 def test_build_upstream_url_dedupes_v1() -> None:
     url = build_upstream_url("https://example.com/v1", "/v1/responses")
     assert url == "https://example.com/v1/responses"

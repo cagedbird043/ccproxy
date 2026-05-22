@@ -35,7 +35,7 @@ class ClaudeAdapter(BaseAdapter):
         headers = {
             key: value
             for key, value in request_headers.items()
-            if key.lower() not in {"host", "authorization", "x-api-key", "content-length"}
+            if key.lower() not in {"host", "authorization", "x-api-key", "content-length", "accept-encoding"}
         }
         api_key = provider["api_key"]
         auth_mode = provider.get("auth_mode", "bearer")
@@ -63,7 +63,7 @@ class CodexAdapter(BaseAdapter):
         headers = {
             key: value
             for key, value in request_headers.items()
-            if key.lower() not in {"host", "authorization", "x-api-key", "content-length"}
+            if key.lower() not in {"host", "authorization", "x-api-key", "content-length", "accept-encoding"}
         }
         headers["Authorization"] = f"Bearer {provider['api_key']}"
         return headers

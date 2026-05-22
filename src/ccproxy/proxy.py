@@ -24,6 +24,7 @@ from ccproxy.health_store import (
 
 HOP_BY_HOP_HEADERS = {
     "connection",
+    "content-encoding",
     "content-length",
     "keep-alive",
     "proxy-authenticate",
@@ -328,6 +329,7 @@ async def forward(request: web.Request) -> web.StreamResponse:
                     upstream_url,
                     headers=headers,
                     data=body,
+                    skip_auto_headers={"Accept-Encoding"},
                 ) as upstream:
                     error_detail: str | None = None
                     quota_exhausted = False
@@ -505,7 +507,7 @@ async def run_proxy(host: str, port: int) -> None:
     config = load_config()
     max_body_bytes = proxy_max_body_bytes(config)
     app = make_app(max_body_bytes)
-    app["session"] = ClientSession(timeout=timeout, auto_decompress=False)
+    app["session"] = ClientSession(timeout=timeout)
     app["health_state"] = load_health_state()
     app["health_lock"] = asyncio.Lock()
 
